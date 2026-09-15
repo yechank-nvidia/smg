@@ -26,7 +26,7 @@ use crate::routers::{
     grpc::{
         common::{response_collection, response_formatting},
         context::{DispatchMetadata, ExecutionResult},
-        proto_wrapper::ProtoGenerateComplete,
+        proto_wrapper::{ProtoGenerateComplete, ProtoOutputLogProbs},
         spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
         utils,
     },
@@ -804,7 +804,7 @@ impl ResponseProcessor {
         execution_result: ExecutionResult,
         completion_req: CompletionResponseSpec,
         dispatch: DispatchMetadata,
-        _tokenizer: Arc<dyn Tokenizer>,
+        tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<CompletionResponse, axum::response::Response> {
         let request_logprobs = completion_req.logprobs;
@@ -926,10 +926,47 @@ impl ResponseProcessor {
                     text.push_str(sfx);
                 }
 
+                let logprobs = if request_logprobs {
+                    let proto =
+                        match complete.output_logprobs() {
+                            Some(proto) => proto,
+                            // No sampled tokens require no scores (for example,
+                            // max_tokens=0). Engines may omit this empty payload.
+                            None if complete.output_ids().is_empty() => ProtoOutputLogProbs {
+                                token_ids: Vec::new(),
+                                token_logprobs: Vec::new(),
+                                top_logprobs: Vec::new(),
+                            },
+                            None => return Err(error::internal_error(
+                                "completion_logprobs_failed",
+                                "Completion logprobs were requested but the backend returned none",
+                            )),
+                        };
+                    Some(
+                        utils::convert_completion_logprobs(
+                            &proto,
+                            complete.output_ids(),
+                            tokenizer.clone(),
+                            completion_req.skip_special_tokens,
+                            &decoded_text,
+                            if completion_req.echo {
+                                prompt_text.chars().count()
+                            } else {
+                                0
+                            },
+                        )
+                        .map_err(|message| {
+                            error::internal_error("completion_logprobs_failed", message)
+                        })?,
+                    )
+                } else {
+                    None
+                };
+
                 choices.push(CompletionChoice {
                     text,
                     index: index_offset + i as u32,
-                    logprobs: None, // TODO: wire legacy LogProbs from backend token_logprobs
+                    logprobs,
                     finish_reason: finish_reason.or_else(|| Some("stop".to_string())),
                     matched_stop,
                 });
@@ -1010,3 +1047,6 @@ mod messages_usage_wire_tests {
         assert_eq!(v["cache_read_input_tokens"], 0);
     }
 }
+
+#[cfg(test)]
+mod completion_logprobs_tests;

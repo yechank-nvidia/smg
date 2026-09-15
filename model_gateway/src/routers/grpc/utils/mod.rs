@@ -1,6 +1,7 @@
 //! Shared utilities for gRPC routers.
 
 mod chat_utils;
+mod completion_logprobs;
 mod logprobs;
 pub(crate) mod message_utils;
 mod metrics;
@@ -15,6 +16,7 @@ pub(crate) use chat_utils::{
     parse_finish_reason, parse_json_schema_response, process_chat_messages_with_placeholders,
     resolve_tokenizer, send_error_sse, validate_chat_content_parts,
 };
+pub(crate) use completion_logprobs::convert_completion_logprobs;
 pub(crate) use logprobs::{
     convert_generate_input_logprobs, convert_generate_output_logprobs, convert_proto_logprobs,
     convert_proto_to_openai_logprobs,
