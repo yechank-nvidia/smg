@@ -744,6 +744,7 @@ fn logprob_replies(ids: &[u32], width: usize, chunk_scores: bool) -> Vec<ts::Gen
                 output_logprobs: Some(scores(ids.len())),
                 matched_stop: None,
                 index: 0,
+                ..Default::default()
             },
         )),
     });
