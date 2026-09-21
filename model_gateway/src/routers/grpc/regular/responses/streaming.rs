@@ -391,7 +391,7 @@ impl StreamingResponseAccumulator {
     }
 
     async fn emit_non_text_items(
-        &self,
+        &mut self,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &SseSender,
     ) -> Result<(), String> {
@@ -401,8 +401,9 @@ impl StreamingResponseAccumulator {
                 .await?;
         }
 
-        for tool_call in &self.tool_calls {
+        for tool_call in &mut self.tool_calls {
             let ResponseOutputItem::FunctionToolCall {
+                id,
                 call_id,
                 name,
                 arguments,
@@ -418,6 +419,9 @@ impl StreamingResponseAccumulator {
 
             let (output_index, item_id) =
                 emitter.allocate_output_index(OutputItemKind::FunctionCall);
+            // Persist the same Responses item identity sent over SSE. The Chat
+            // tool-call identity remains separate and unchanged in call_id.
+            *id = Some(item_id.clone());
             let mut item = json!({
                 "id": item_id,
                 "type": "function_call",
@@ -1287,5 +1291,115 @@ mod tests {
         assert_eq!(wire["output"][0]["name"], "lookup");
         assert_eq!(wire["output"][0]["namespace"], "weather");
         assert_eq!(wire["output"][0]["arguments"], "{}");
+    }
+
+    #[tokio::test]
+    async fn streamed_function_call_ids_match_completed_and_stored_items() {
+        let request = ResponsesRequest::default();
+        let mut accumulator = StreamingResponseAccumulator::new(&request);
+        // Two calls arrive together; their argument suffixes arrive in reverse
+        // order, so matching IDs must follow the tool index, not arrival order.
+        for deltas in [
+            json!([
+                {"index": 0, "id": "call_weather", "type": "function",
+                 "function": {"name": "weather", "arguments": "{\"city\":"}},
+                {"index": 1, "id": "call_clock", "type": "function",
+                 "function": {"name": "clock", "arguments": "{\"zone\":"}}
+            ]),
+            json!([
+                {"index": 1, "function": {"arguments": "\"UTC\"}"}},
+                {"index": 0, "function": {"arguments": "\"Paris\"}"}}
+            ]),
+        ] {
+            let chunk: ChatCompletionStreamResponse = serde_json::from_value(json!({
+                "id": "chatcmpl_tools",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "test-model",
+                "choices": [{"index": 0, "delta": {"tool_calls": deltas}}]
+            }))
+            .expect("valid Chat tool-call chunk");
+            accumulator.process_chunk(&chunk);
+        }
+        accumulator.process_chunk(
+            &ChatCompletionStreamResponse::builder("chatcmpl_tools", "test-model")
+                .add_choice_finish_reason(0, "tool_calls", None)
+                .build(),
+        );
+
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_tools".to_string(), "test-model".to_string(), 1);
+        let (tx, mut rx) = sse_channel();
+        accumulator
+            .emit_non_text_items(&mut emitter, &tx)
+            .await
+            .expect("emit both function calls");
+        let completed = emitter.emit_completed(None);
+        emitter
+            .send_event(&completed, &tx)
+            .await
+            .expect("emit completed response");
+        let stored = serde_json::to_value(accumulator.finalize())
+            .expect("serialize finalized response for storage");
+        drop(tx);
+
+        // Inspect actual SSE serialization rather than only emitter values.
+        let mut events: Vec<Value> = Vec::new();
+        while let Some(frame) = rx.recv().await {
+            let frame = frame.expect("successful SSE frame");
+            let wire = std::str::from_utf8(&frame).expect("UTF-8 SSE frame");
+            let data = wire
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("SSE data field");
+            events.push(serde_json::from_str(data).expect("serialized SSE JSON"));
+        }
+        assert_eq!(events.len(), 9);
+        assert_eq!(events[8]["type"], "response.completed");
+        let completed_output = events[8]["response"]["output"]
+            .as_array()
+            .expect("completed output items");
+        let stored_output = stored["output"].as_array().expect("stored output items");
+        assert_eq!(completed_output.len(), 2);
+        assert_eq!(completed_output, stored_output);
+
+        for (index, (call_id, name, arguments)) in [
+            ("call_weather", "weather", r#"{"city":"Paris"}"#),
+            ("call_clock", "clock", r#"{"zone":"UTC"}"#),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let added = &events[4 * index];
+            let delta = &events[4 * index + 1];
+            let arguments_done = &events[4 * index + 2];
+            let done = &events[4 * index + 3];
+            let item_id = added["item"]["id"].as_str().expect("function item ID");
+            assert!(item_id.starts_with("fc_"));
+            assert_ne!(item_id, call_id);
+            assert_eq!(added["type"], "response.output_item.added");
+            assert_eq!(delta["type"], "response.function_call_arguments.delta");
+            assert_eq!(
+                arguments_done["type"],
+                "response.function_call_arguments.done"
+            );
+            assert_eq!(done["type"], "response.output_item.done");
+            for event in [added, delta, arguments_done, done] {
+                assert_eq!(event["output_index"], json!(index));
+            }
+            assert_eq!(added["item"]["arguments"], "");
+            assert_eq!(delta["item_id"], item_id);
+            assert_eq!(delta["delta"], arguments);
+            assert_eq!(arguments_done["item_id"], item_id);
+            assert_eq!(arguments_done["arguments"], arguments);
+            assert_eq!(done["item"]["id"], item_id);
+            assert_eq!(done["item"], completed_output[index]);
+            assert_eq!(stored_output[index]["id"], item_id);
+            for item in [&added["item"], &done["item"], &stored_output[index]] {
+                assert_eq!(item["call_id"], call_id);
+                assert_eq!(item["name"], name);
+            }
+        }
+        assert_ne!(stored_output[0]["id"], stored_output[1]["id"]);
     }
 }
