@@ -523,7 +523,7 @@ fn visible_stop_chat_payload(stream: bool) -> Value {
     payload
 }
 
-async fn request_json(app: &axum::Router, uri: &str, payload: Value) -> Value {
+async fn request_body(app: &axum::Router, uri: &str, payload: Value) -> (StatusCode, bytes::Bytes) {
     let request = Request::builder()
         .method("POST")
         .uri(uri)
@@ -537,6 +537,11 @@ async fn request_json(app: &axum::Router, uri: &str, payload: Value) -> Value {
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read response body");
+    (status, body)
+}
+
+async fn request_json(app: &axum::Router, uri: &str, payload: Value) -> Value {
+    let (status, body) = request_body(app, uri, payload).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -547,19 +552,7 @@ async fn request_json(app: &axum::Router, uri: &str, payload: Value) -> Value {
 }
 
 async fn request_sse(app: &axum::Router, uri: &str, payload: Value) -> Vec<Value> {
-    let request = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&payload).expect("request json"),
-        ))
-        .expect("build request");
-    let response = app.clone().oneshot(request).await.expect("route request");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read response stream");
+    let (status, body) = request_body(app, uri, payload).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -823,6 +816,7 @@ async fn response_template_gateway_logprobs_match_raw_unary() {
     for (tail, content, finish) in [
         ("aaaa<|end|>", "aaaa", "length"),
         ("aaaa<|return|>", "aaaa", "stop"),
+        ("aaaa", "aaaa", "length"),
     ] {
         let wire =
             format!("<|channel|>analysis<|message|><|end|><|channel|>final<|message|>{tail}");
@@ -850,6 +844,7 @@ async fn response_template_gateway_logprobs_match_raw_unary() {
             install_test_generate_replies(port, logprob_replies(&ids, width, chunk_scores));
             let unary = request_json(&app, "/v1/chat/completions", payload(false, true)).await;
             let events = request_sse(&app, "/v1/chat/completions", payload(true, true)).await;
+            assert_eq!(unary["choices"][0]["finish_reason"], finish);
             assert_eq!(unary["choices"][0]["logprobs"]["content"], json!(expected));
             let score_events = events
                 .iter()
@@ -922,6 +917,50 @@ async fn response_template_gateway_logprobs_match_raw_unary() {
                 .iter()
                 .all(|event| event["choices"][0]["logprobs"].is_null()));
             assert_eq!(normalize_chat_events(&unrequested), mapped);
+        }
+    }
+
+    // A backend stop/abort, missing terminal, or earlier local stop must not
+    // inherit length-limit leniency. Replay both HTTP response modes.
+    for (reason, local_stop, terminal) in [
+        ("stop", false, true),
+        ("abort", false, true),
+        ("length", true, true),
+        ("length", false, false),
+    ] {
+        let ids = OracleTokenizer::token_ids("<|channel|>final<|message|>partSTOP");
+        let mut replies = logprob_replies(&ids, 1, false);
+        if terminal {
+            let Some(ts::generate_response::Response::Complete(complete)) =
+                replies.last_mut().unwrap().response.as_mut()
+            else {
+                panic!("terminal fixture")
+            };
+            complete.finish_reason = reason.to_owned();
+        } else {
+            replies.pop();
+        }
+        install_test_generate_replies(port, replies);
+        for stream in [false, true] {
+            let mut request = payload(stream, false);
+            request["stop"] = if local_stop {
+                json!(["STOP"])
+            } else {
+                json!([])
+            };
+            if stream {
+                let events = request_sse(&app, "/v1/chat/completions", request).await;
+                assert!(
+                    events.iter().any(|event| event["error"].is_object()),
+                    "{events:?}"
+                );
+                assert!(events
+                    .iter()
+                    .all(|event| event["choices"][0]["finish_reason"].is_null()));
+            } else {
+                let (status, body) = request_body(&app, "/v1/chat/completions", request).await;
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body:?}");
+            }
         }
     }
 }
