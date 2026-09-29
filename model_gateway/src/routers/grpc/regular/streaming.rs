@@ -31,6 +31,7 @@ use openai_protocol::{
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
 use serde::Serialize;
 use serde_json::{json, Value};
+use smg_response_template::adapter::Session;
 use tokio_stream::wrappers::ReceiverStream;
 use tool_parser::{
     types::ToolCallItem, ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser,
@@ -404,6 +405,8 @@ impl StreamingProcessor {
         type PooledToolParser = Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>;
         let mut tool_parsers: HashMap<u32, PooledToolParser> = HashMap::new();
         let mut has_tool_calls: HashMap<u32, bool> = HashMap::new();
+        // One response-template session per choice, shared by its two parsers.
+        let mut sessions: HashMap<u32, Session> = HashMap::new();
 
         // Per-index stop decoders (each index needs its own state for n>1 support)
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
@@ -656,6 +659,12 @@ impl StreamingProcessor {
             // Calculate delta
             let mut delta = text;
             stream_buffer.push_str(&delta);
+            let session = original_request.response_template.as_ref().map(|seed| {
+                sessions
+                    .entry(index)
+                    .or_insert_with(|| seed.session())
+                    .clone()
+            });
 
             // Reasoning content handling
             let in_reasoning = if separate_reasoning && reasoning_parser_available {
@@ -664,6 +673,7 @@ impl StreamingProcessor {
                         (!final_chunk).then_some(delta.as_str()),
                         index,
                         &mut reasoning_parsers,
+                        session.as_ref(),
                         thinking_override,
                         think_in_prefill,
                         reasoning_parser_name.as_deref(),
@@ -718,6 +728,7 @@ impl StreamingProcessor {
                             &delta,
                             index,
                             &mut tool_parsers,
+                            session.as_ref(),
                             &mut has_tool_calls,
                             tools_ref,
                             tool_parser_name.as_deref(),
@@ -1524,6 +1535,7 @@ impl StreamingProcessor {
         delta: Option<&str>,
         index: u32,
         reasoning_parsers: &mut HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
+        session: Option<&Session>,
         thinking_override: bool,
         think_in_prefill: bool,
         // Resolved once per request by the caller: re-resolving here could
@@ -1547,6 +1559,9 @@ impl StreamingProcessor {
                 model,
             )
             .expect("Parser should be available - checked upfront");
+            if let Some(session) = session {
+                parser.attach_response_session(session.clone());
+            }
             if thinking_override {
                 parser.mark_reasoning_started();
                 if think_in_prefill {
@@ -1654,6 +1669,7 @@ impl StreamingProcessor {
         delta: &str,
         index: u32,
         tool_parsers: &mut HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>>,
+        session: Option<&Session>,
         has_tool_calls: &mut HashMap<u32, bool>,
         tools: &[Tool],
         // Resolved once per request by the caller (see process_reasoning_stream).
@@ -1673,13 +1689,16 @@ impl StreamingProcessor {
             reason = "parser availability is checked upfront before streaming begins"
         )]
         tool_parsers.entry(index).or_insert_with(|| {
-            let parser = if use_json_parser {
+            let mut parser = if use_json_parser {
                 utils::create_tool_parser(&self.tool_parser_factory, Some("json"), model)
                     .expect("JSON parser should be available")
             } else {
                 utils::create_tool_parser(&self.tool_parser_factory, tool_parser_name, model)
                     .expect("Parser should be available - checked upfront")
             };
+            if let Some(session) = session {
+                parser.attach_response_session(session.clone());
+            }
             Arc::new(tokio::sync::Mutex::new(parser))
         });
 
@@ -1844,10 +1863,12 @@ impl StreamingProcessor {
     /// Returns `(normal_text, reasoning_text, in_reasoning)`.
     /// `None` marks EOF and releases the parser's held text.
     /// Caller handles SSE event emission.
+    #[expect(clippy::too_many_arguments)]
     async fn process_messages_reasoning(
         &self,
         delta: Option<&str>,
         reasoning_parser: &mut Option<Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
+        session: Option<&Session>,
         thinking_override: bool,
         think_in_prefill: bool,
         // Resolved once per request by the caller (see process_reasoning_stream).
@@ -1861,6 +1882,9 @@ impl StreamingProcessor {
                 reasoning_parser_name,
                 model,
             ) {
+                if let Some(session) = session {
+                    parser.attach_response_session(session.clone());
+                }
                 if thinking_override {
                     parser.mark_reasoning_started();
                     if think_in_prefill {
@@ -2173,6 +2197,13 @@ impl StreamingProcessor {
             } else {
                 None
             };
+        let session = original_request
+            .response_template
+            .as_ref()
+            .map(utils::ResponseSessionSeed::session);
+        if let (Some(parser), Some(session)) = (&mut streaming_tool_parser, &session) {
+            parser.attach_response_session(session.clone());
+        }
 
         // Phase 1: Emit message_start with skeleton Message
         let start_message = Message {
@@ -2276,6 +2307,7 @@ impl StreamingProcessor {
                 self.process_messages_reasoning(
                     (!final_chunk).then_some(chunk_text.as_str()),
                     &mut reasoning_parser,
+                    session.as_ref(),
                     thinking_override,
                     think_in_prefill,
                     reasoning_parser_name.as_deref(),
