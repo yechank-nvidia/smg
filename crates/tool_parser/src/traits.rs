@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use openai_protocol::common::Tool;
+use smg_response_template::adapter::Session;
 
 use crate::{
     errors::ParserResult,
@@ -67,6 +68,10 @@ pub trait ToolParser: Send + Sync {
     fn reset(&mut self) {
         // Default no-op implementation
     }
+
+    /// Parse this output with a response-template session that the output's
+    /// reasoning parser shares. Only the response-template parser uses it.
+    fn attach_response_session(&mut self, _session: Session) {}
 }
 
 /// Trait for partial JSON parsing
