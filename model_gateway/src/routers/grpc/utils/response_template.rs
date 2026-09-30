@@ -89,6 +89,10 @@ impl ResponseTemplateParsers {
 /// rounds some float literals differently from Python's `json.loads` and reads
 /// integers beyond u64 as floats, and a float can reach the output or decide how
 /// the template parses (`strip`, `version`, ...).
+///
+/// A follow-up can drop this refusal: keep the template's raw text from
+/// `tokenizer_config.json` (a `serde_json::value::RawValue`) and read it with
+/// the crate's port of `json.loads`, which parses numbers as Python does.
 fn has_float(value: &Value) -> bool {
     match value {
         Value::Number(n) => n.is_f64(),
