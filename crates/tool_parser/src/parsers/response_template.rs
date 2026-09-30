@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use openai_protocol::common::Tool;
 use serde_json::Value;
 use smg_response_template::{
-    adapter::{self, Session},
+    adapter::{self, ResponseParserState},
     ResponseTemplate,
 };
 
@@ -16,15 +16,15 @@ use crate::{
 };
 
 /// Reads the `tool_calls` field of a response template with the transformers
-/// parser of a [`Session`]. When the reasoning parser of the same output feeds
-/// the session, the input is its content and the calls are the ones it
-/// closed; otherwise this parser feeds the session and reasoning text stays in
+/// parser of a [`ResponseParserState`]. When the reasoning parser of the same
+/// output feeds the state, the input is its content and the calls are the ones
+/// it closed; otherwise this parser feeds the state and reasoning text stays in
 /// the content. A call is reported whole, name and arguments, when its region
-/// closes. Without an attached session the parser has no prompt, as
+/// closes. Without an attached state the parser has no prompt, as
 /// transformers with `prefix=""`.
 pub struct TemplateToolParser {
     template: ResponseTemplate,
-    session: Option<Session>,
+    state: Option<ResponseParserState>,
     /// Calls reported so far.
     reported: usize,
     /// Calls closed at the end of the output.
@@ -35,18 +35,18 @@ impl TemplateToolParser {
     pub fn new(template: ResponseTemplate) -> Self {
         Self {
             template,
-            session: None,
+            state: None,
             reported: 0,
             unstreamed: Vec::new(),
         }
     }
 
-    fn new_session(&self, tools: &[Tool]) -> Session {
+    fn new_state(&self, tools: &[Tool]) -> ResponseParserState {
         let tools: Vec<Value> = tools
             .iter()
             .filter_map(|tool| serde_json::to_value(tool).ok())
             .collect();
-        Session::new(&self.template, "", &tools, false)
+        ResponseParserState::new(&self.template, "", &tools, false)
     }
 
     fn items(&mut self, calls: Vec<adapter::ToolCall>) -> Vec<ToolCallItem> {
@@ -87,12 +87,9 @@ impl ToolParser for TemplateToolParser {
         output: &str,
         tools: &[Tool],
     ) -> ParserResult<(String, Vec<ToolCall>)> {
-        let session = self
-            .session
-            .clone()
-            .unwrap_or_else(|| self.new_session(tools));
-        let (mut text, mut calls) = session.tools(Some(output)).map_err(failed)?;
-        let (rest, more) = session.tools(None).map_err(failed)?;
+        let state = self.state.clone().unwrap_or_else(|| self.new_state(tools));
+        let (mut text, mut calls) = state.tools(Some(output)).map_err(failed)?;
+        let (rest, more) = state.tools(None).map_err(failed)?;
         text.push_str(&rest);
         calls.extend(more);
         let calls = calls
@@ -112,11 +109,11 @@ impl ToolParser for TemplateToolParser {
         chunk: &str,
         tools: &[Tool],
     ) -> ParserResult<StreamingParseResult> {
-        let session = match &self.session {
-            Some(session) => session.clone(),
-            None => self.session.insert(self.new_session(tools)).clone(),
+        let state = match &self.state {
+            Some(state) => state.clone(),
+            None => self.state.insert(self.new_state(tools)).clone(),
         };
-        let (normal_text, calls) = session.tools(Some(chunk)).unwrap_or_else(|error| {
+        let (normal_text, calls) = state.tools(Some(chunk)).unwrap_or_else(|error| {
             tracing::warn!("response template: {error}; the rest of the output is not parsed");
             (chunk.to_owned(), Vec::new())
         });
@@ -127,12 +124,10 @@ impl ToolParser for TemplateToolParser {
     }
 
     fn has_tool_markers(&self, text: &str) -> bool {
-        let session = self.new_session(&[]);
-        [Some(text), None].into_iter().any(|text| {
-            session
-                .tools(text)
-                .is_ok_and(|(_, calls)| !calls.is_empty())
-        })
+        let state = self.new_state(&[]);
+        [Some(text), None]
+            .into_iter()
+            .any(|text| state.tools(text).is_ok_and(|(_, calls)| !calls.is_empty()))
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
@@ -142,10 +137,10 @@ impl ToolParser for TemplateToolParser {
     /// Ends the output: the rest of the content, and the calls it closed for
     /// `get_unstreamed_tool_args`.
     fn take_unstreamed_normal_text(&mut self) -> String {
-        let Some(session) = self.session.clone() else {
+        let Some(state) = self.state.clone() else {
             return String::new();
         };
-        let (text, calls) = session.tools(None).unwrap_or_else(|error| {
+        let (text, calls) = state.tools(None).unwrap_or_else(|error| {
             tracing::warn!("response template: {error}");
             (String::new(), Vec::new())
         });
@@ -154,12 +149,12 @@ impl ToolParser for TemplateToolParser {
     }
 
     fn reset(&mut self) {
-        self.session = None;
+        self.state = None;
         self.reported = 0;
         self.unstreamed.clear();
     }
 
-    fn attach_response_session(&mut self, session: Session) {
-        self.session = Some(session);
+    fn attach_response_parser_state(&mut self, state: ResponseParserState) {
+        self.state = Some(state);
     }
 }

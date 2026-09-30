@@ -1,7 +1,7 @@
 //! Glue for smg's reasoning and tool parsers (feature `adapter`); not part of
-//! transformers. A [`Session`] holds the [`ResponseParser`] of one generated
-//! choice, and the choice's reasoning and tool parsers share it. They read the
-//! fields `transformers serve` reads: `thinking` (here also
+//! transformers. A [`ResponseParserState`] holds the [`ResponseParser`] of one
+//! generated choice, and the choice's reasoning and tool parsers share it. They
+//! read the fields `transformers serve` reads: `thinking` (here also
 //! `reasoning_content`), `content` and `tool_calls`. A stream reads the text of
 //! their regions and each closed tool-call region after the prompt; a complete
 //! output reads the parsed message.
@@ -96,9 +96,9 @@ fn read_calls(value: &Value, calls: &mut Vec<ToolCall>) -> Result<(), ParseError
 /// reasoning and tool parsers (clones share it). After an error, text passes
 /// through unparsed.
 #[derive(Clone)]
-pub struct Session(Arc<Mutex<State>>);
+pub struct ResponseParserState(Arc<Mutex<Inner>>);
 
-struct State {
+struct Inner {
     /// `None` once the output ended, or after an error.
     parser: Option<ResponseParser>,
     /// What the prompt raised, for the first call.
@@ -116,8 +116,8 @@ struct Text {
     content: String,
 }
 
-impl Session {
-    /// A session for one output. `prompt_tail` is the rendered prompt after the
+impl ResponseParserState {
+    /// The state of one output. `prompt_tail` is the rendered prompt after the
     /// template's last start anchor (transformers' `prefix`, truncated), and
     /// `tools` cast tool-call arguments. With `continuation` (the prompt ends
     /// inside the assistant message), a complete output returns what was
@@ -132,7 +132,7 @@ impl Session {
             Ok(parser) => (Some(parser), None),
             Err(error) => (None, Some(error)),
         };
-        Self(Arc::new(Mutex::new(State {
+        Self(Arc::new(Mutex::new(Inner {
             parser,
             error,
             continuation,
@@ -141,7 +141,7 @@ impl Session {
         })))
     }
 
-    fn state(&self) -> MutexGuard<'_, State> {
+    fn state(&self) -> MutexGuard<'_, Inner> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -194,9 +194,9 @@ impl Session {
     }
 
     /// For the tool parser: the content and tool calls of streamed `text`
-    /// (`None` ends the output). When the reasoning parser feeds the session,
+    /// (`None` ends the output). When the reasoning parser feeds this state,
     /// `text` is its content and passes through with the calls it closed;
-    /// otherwise the session is fed `text`, and reasoning is content.
+    /// otherwise this state is fed `text`, and reasoning is content.
     pub fn tools(&self, text: Option<&str>) -> Result<(String, Vec<ToolCall>), ParseError> {
         let mut state = self.state();
         let mut out = Text::default();
@@ -209,7 +209,7 @@ impl Session {
     }
 }
 
-impl State {
+impl Inner {
     /// Feed `output` (`None` ends it) and read the region events, reasoning
     /// into the content when `merge`. Without a parser, `output` passes
     /// through.

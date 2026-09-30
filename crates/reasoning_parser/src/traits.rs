@@ -1,6 +1,6 @@
 use std::fmt;
 
-use smg_response_template::adapter::Session;
+use smg_response_template::adapter::ResponseParserState;
 
 /// Result of parsing text for reasoning content.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -105,9 +105,9 @@ pub trait ReasoningParser: Send + Sync {
     /// from the model output when the template already included it.
     fn mark_think_start_stripped(&mut self);
 
-    /// Parse this output with a response-template session that the output's
+    /// Parse this output with a [`ResponseParserState`] that the output's
     /// tool parser shares. Only the response-template parser uses it.
-    fn attach_response_session(&mut self, _session: Session) {}
+    fn attach_response_parser_state(&mut self, _state: ResponseParserState) {}
 }
 
 /// Error types for reasoning parsing operations.

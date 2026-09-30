@@ -12,7 +12,7 @@ mod common;
 use common::{canonical, fixtures_dir, read_json, read_jsonl, tag, untag};
 use serde_json::{json, Value};
 use smg_response_template::{
-    adapter::{check, Session, ToolCall},
+    adapter::{check, ResponseParserState, ToolCall},
     load_response_template, parse_response, ResponseParser, ResponseTemplate,
 };
 
@@ -108,9 +108,9 @@ fn crate_stream(
     Some(read)
 }
 
-fn session(template: &ResponseTemplate, prefix: &str, tools: &[Value]) -> Session {
+fn new_state(template: &ResponseTemplate, prefix: &str, tools: &[Value]) -> ResponseParserState {
     let tail = template.truncate_past_last_anchor(prefix);
-    Session::new(template, tail, tools, false)
+    ResponseParserState::new(template, tail, tools, false)
 }
 
 fn push_calls(read: &mut Read, calls: Vec<ToolCall>) {
@@ -118,42 +118,42 @@ fn push_calls(read: &mut Read, calls: Vec<ToolCall>) {
         .extend(calls.iter().map(|c| call(&json!(c.name), &c.arguments)));
 }
 
-/// A stream through a session, as the gateway calls the parsers: the
+/// A stream through a parser state, as the gateway calls the parsers: the
 /// reasoning parser feeds each chunk (or, without it, the tool parser) and the
 /// tool parser takes the content.
-fn session_stream(
+fn state_stream(
     template: &ResponseTemplate,
     prefix: &str,
     tools: &[Value],
     chunks: &[&str],
     with_reasoning: bool,
 ) -> Option<Read> {
-    let session = session(template, prefix, tools);
+    let state = new_state(template, prefix, tools);
     let mut read = Read::default();
     for chunk in chunks.iter().copied().map(Some).chain([None]) {
         let content = if with_reasoning {
-            let (reasoning, content) = session.reasoning(chunk).ok()?;
+            let (reasoning, content) = state.reasoning(chunk).ok()?;
             read.reasoning.push_str(&reasoning);
             Some(content)
         } else {
             chunk.map(str::to_owned)
         };
-        let (content, calls) = session.tools(content.as_deref()).ok()?;
+        let (content, calls) = state.tools(content.as_deref()).ok()?;
         read.content.push_str(&content);
         push_calls(&mut read, calls);
     }
     Some(read)
 }
 
-fn session_complete(
+fn state_complete(
     template: &ResponseTemplate,
     prefix: &str,
     tools: &[Value],
     text: &str,
 ) -> Option<Read> {
-    let session = session(template, prefix, tools);
-    let (reasoning, content) = session.reasoning_complete(text).ok()?;
-    let (content, calls) = session.tools(Some(&content)).ok()?;
+    let state = new_state(template, prefix, tools);
+    let (reasoning, content) = state.reasoning_complete(text).ok()?;
+    let (content, calls) = state.tools(Some(&content)).ok()?;
     let mut read = Read {
         reasoning,
         content,
@@ -197,7 +197,7 @@ fn replay(name: &str) -> (usize, usize) {
         let expected = parse_response(text, template, prefix, &tools)
             .ok()
             .and_then(|message| serve_message(&Value::Object(message)));
-        let got = session_complete(template, prefix, &tools, text);
+        let got = state_complete(template, prefix, &tools, text);
         if got != expected {
             failures.push(format!("{id} complete: {got:?}, expected {expected:?}"));
         }
@@ -221,7 +221,7 @@ fn replay(name: &str) -> (usize, usize) {
                 if trace[0][0] != "init" {
                     expected = None;
                 }
-                let got = session_stream(template, prefix, &tools, &[text], !merge);
+                let got = state_stream(template, prefix, &tools, &[text], !merge);
                 if got != expected {
                     failures.push(format!(
                         "{id} stream (merge {merge}): {got:?}, expected {expected:?}"
@@ -237,7 +237,7 @@ fn replay(name: &str) -> (usize, usize) {
                 let chunks = [&text[..b], &text[b..]];
                 for merge in [false, true] {
                     let expected = crate_stream(template, prefix, &tools, &chunks, merge);
-                    let got = session_stream(template, prefix, &tools, &chunks, !merge);
+                    let got = state_stream(template, prefix, &tools, &chunks, !merge);
                     if got != expected {
                         failures.push(format!(
                             "{id} split at {b} (merge {merge}): {got:?}, expected {expected:?}"

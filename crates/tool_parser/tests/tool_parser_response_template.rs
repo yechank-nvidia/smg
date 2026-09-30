@@ -7,7 +7,9 @@ mod common;
 
 use common::create_test_tools;
 use serde_json::{json, Value};
-use smg_response_template::{adapter::Session, load_response_template, ResponseTemplate};
+use smg_response_template::{
+    adapter::ResponseParserState, load_response_template, ResponseTemplate,
+};
 use tool_parser::{traits::ToolParser, TemplateToolParser};
 
 fn qwen3_5() -> ResponseTemplate {
@@ -79,14 +81,19 @@ async fn stream(
 }
 
 #[tokio::test]
-async fn without_a_reasoning_parser_it_feeds_the_session_and_keeps_reasoning_as_content() {
+async fn without_a_reasoning_parser_it_feeds_the_parser_state_and_keeps_reasoning_as_content() {
     let template = qwen3_5();
     let mut parser = TemplateToolParser::new(template.clone());
     let tools: Vec<Value> = create_test_tools()
         .iter()
         .map(|tool| serde_json::to_value(tool).unwrap())
         .collect();
-    parser.attach_response_session(Session::new(&template, "<think>\n", &tools, false));
+    parser.attach_response_parser_state(ResponseParserState::new(
+        &template,
+        "<think>\n",
+        &tools,
+        false,
+    ));
     let output = format!("plan\n</think>\n\nSure.{CALL}");
     let (normal, calls) = stream(&mut parser, &output).await;
     assert_eq!(normal, "plan\n\n\nSure.");
@@ -99,22 +106,22 @@ async fn without_a_reasoning_parser_it_feeds_the_session_and_keeps_reasoning_as_
 #[tokio::test]
 async fn with_a_reasoning_parser_it_takes_the_calls_that_parser_closed() {
     let template = qwen3_5();
-    let session = Session::new(&template, "", &[], false);
+    let state = ResponseParserState::new(&template, "", &[], false);
     let mut parser = TemplateToolParser::new(template);
-    parser.attach_response_session(session.clone());
+    parser.attach_response_parser_state(state.clone());
     let tools = create_test_tools();
 
     let output = "<tool_call>\n<function=get_time>\n</function>\n</tool_call>\n<think>again";
-    let (reasoning, content) = session.reasoning(Some(output)).unwrap();
+    let (reasoning, content) = state.reasoning(Some(output)).unwrap();
     assert_eq!((reasoning.as_str(), content.as_str()), ("again", "\n"));
     // Reasoning goes on, but a call waits: the tool parser must run now.
-    assert!(!session.in_reasoning());
+    assert!(!state.in_reasoning());
     let result = parser.parse_incremental(&content, &tools).await.unwrap();
     assert_eq!(result.normal_text, "\n");
     assert_eq!(result.calls.len(), 1);
     assert_eq!(result.calls[0].name.as_deref(), Some("get_time"));
     assert_eq!(result.calls[0].parameters, "{}");
-    assert!(session.in_reasoning());
+    assert!(state.in_reasoning());
 }
 
 #[tokio::test]

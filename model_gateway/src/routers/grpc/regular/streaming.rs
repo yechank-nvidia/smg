@@ -31,7 +31,7 @@ use openai_protocol::{
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
 use serde::Serialize;
 use serde_json::{json, Value};
-use smg_response_template::adapter::Session;
+use smg_response_template::adapter::ResponseParserState;
 use tokio_stream::wrappers::ReceiverStream;
 use tool_parser::{
     types::ToolCallItem, ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser,
@@ -405,8 +405,8 @@ impl StreamingProcessor {
         type PooledToolParser = Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>;
         let mut tool_parsers: HashMap<u32, PooledToolParser> = HashMap::new();
         let mut has_tool_calls: HashMap<u32, bool> = HashMap::new();
-        // One response-template session per choice, shared by its two parsers.
-        let mut sessions: HashMap<u32, Session> = HashMap::new();
+        // One response-parser state per choice, shared by its two parsers.
+        let mut states: HashMap<u32, ResponseParserState> = HashMap::new();
 
         // Per-index stop decoders (each index needs its own state for n>1 support)
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
@@ -659,10 +659,10 @@ impl StreamingProcessor {
             // Calculate delta
             let mut delta = text;
             stream_buffer.push_str(&delta);
-            let session = original_request.response_template.as_ref().map(|seed| {
-                sessions
+            let state = original_request.response_parser.as_ref().map(|spec| {
+                states
                     .entry(index)
-                    .or_insert_with(|| seed.session())
+                    .or_insert_with(|| spec.new_state())
                     .clone()
             });
 
@@ -673,7 +673,7 @@ impl StreamingProcessor {
                         (!final_chunk).then_some(delta.as_str()),
                         index,
                         &mut reasoning_parsers,
-                        session.as_ref(),
+                        state.as_ref(),
                         thinking_override,
                         think_in_prefill,
                         reasoning_parser_name.as_deref(),
@@ -728,7 +728,7 @@ impl StreamingProcessor {
                             &delta,
                             index,
                             &mut tool_parsers,
-                            session.as_ref(),
+                            state.as_ref(),
                             &mut has_tool_calls,
                             tools_ref,
                             tool_parser_name.as_deref(),
@@ -1535,7 +1535,7 @@ impl StreamingProcessor {
         delta: Option<&str>,
         index: u32,
         reasoning_parsers: &mut HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
-        session: Option<&Session>,
+        state: Option<&ResponseParserState>,
         thinking_override: bool,
         think_in_prefill: bool,
         // Resolved once per request by the caller: re-resolving here could
@@ -1559,8 +1559,8 @@ impl StreamingProcessor {
                 model,
             )
             .expect("Parser should be available - checked upfront");
-            if let Some(session) = session {
-                parser.attach_response_session(session.clone());
+            if let Some(state) = state {
+                parser.attach_response_parser_state(state.clone());
             }
             if thinking_override {
                 parser.mark_reasoning_started();
@@ -1669,7 +1669,7 @@ impl StreamingProcessor {
         delta: &str,
         index: u32,
         tool_parsers: &mut HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>>,
-        session: Option<&Session>,
+        state: Option<&ResponseParserState>,
         has_tool_calls: &mut HashMap<u32, bool>,
         tools: &[Tool],
         // Resolved once per request by the caller (see process_reasoning_stream).
@@ -1696,8 +1696,8 @@ impl StreamingProcessor {
                 utils::create_tool_parser(&self.tool_parser_factory, tool_parser_name, model)
                     .expect("Parser should be available - checked upfront")
             };
-            if let Some(session) = session {
-                parser.attach_response_session(session.clone());
+            if let Some(state) = state {
+                parser.attach_response_parser_state(state.clone());
             }
             Arc::new(tokio::sync::Mutex::new(parser))
         });
@@ -1868,7 +1868,7 @@ impl StreamingProcessor {
         &self,
         delta: Option<&str>,
         reasoning_parser: &mut Option<Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
-        session: Option<&Session>,
+        state: Option<&ResponseParserState>,
         thinking_override: bool,
         think_in_prefill: bool,
         // Resolved once per request by the caller (see process_reasoning_stream).
@@ -1882,8 +1882,8 @@ impl StreamingProcessor {
                 reasoning_parser_name,
                 model,
             ) {
-                if let Some(session) = session {
-                    parser.attach_response_session(session.clone());
+                if let Some(state) = state {
+                    parser.attach_response_parser_state(state.clone());
                 }
                 if thinking_override {
                     parser.mark_reasoning_started();
@@ -2197,12 +2197,12 @@ impl StreamingProcessor {
             } else {
                 None
             };
-        let session = original_request
-            .response_template
+        let state = original_request
+            .response_parser
             .as_ref()
-            .map(utils::ResponseSessionSeed::session);
-        if let (Some(parser), Some(session)) = (&mut streaming_tool_parser, &session) {
-            parser.attach_response_session(session.clone());
+            .map(utils::ResponseParserSpec::new_state);
+        if let (Some(parser), Some(state)) = (&mut streaming_tool_parser, &state) {
+            parser.attach_response_parser_state(state.clone());
         }
 
         // Phase 1: Emit message_start with skeleton Message
@@ -2307,7 +2307,7 @@ impl StreamingProcessor {
                 self.process_messages_reasoning(
                     (!final_chunk).then_some(chunk_text.as_str()),
                     &mut reasoning_parser,
-                    session.as_ref(),
+                    state.as_ref(),
                     thinking_override,
                     think_in_prefill,
                     reasoning_parser_name.as_deref(),

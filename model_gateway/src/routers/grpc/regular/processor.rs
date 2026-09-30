@@ -18,7 +18,7 @@ use openai_protocol::{
     messages::{self, Message},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
-use smg_response_template::adapter::Session;
+use smg_response_template::adapter::ResponseParserState;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
 
@@ -107,10 +107,10 @@ impl ResponseProcessor {
         // Step 1: Handle reasoning content parsing
         let mut reasoning_text: Option<String> = None;
         let mut processed_text = final_text;
-        let session = original_request
-            .response_template
+        let state = original_request
+            .response_parser
             .as_ref()
-            .map(utils::ResponseSessionSeed::session);
+            .map(utils::ResponseParserSpec::new_state);
 
         if original_request.separate_reasoning && reasoning_parser_available {
             // Fresh parser per request: non-streaming extraction keeps no state
@@ -120,8 +120,8 @@ impl ResponseProcessor {
                 reasoning_parser_name,
                 model,
             ) {
-                if let Some(session) = &session {
-                    parser.attach_response_session(session.clone());
+                if let Some(state) = &state {
+                    parser.attach_response_parser_state(state.clone());
                 }
                 // If the template injected `<think>` in the prefill (thinking toggle
                 // is supported and effectively ON), start in reasoning mode.
@@ -182,7 +182,7 @@ impl ResponseProcessor {
                         tool_parser_name,
                         original_request.tools.as_deref().unwrap_or(&[]),
                         history_tool_calls_count,
-                        session,
+                        state,
                     )
                     .await;
             }
@@ -343,13 +343,13 @@ impl ResponseProcessor {
         tool_parser_name: Option<&str>,
         tools: &[Tool],
         history_tool_calls_count: usize,
-        // A response-template session is per request: it needs a fresh parser.
-        session: Option<Session>,
+        // A response-parser state is per request: it needs a fresh parser.
+        state: Option<ResponseParserState>,
     ) -> (Option<Vec<ToolCall>>, String) {
-        let fresh = session.and_then(|session| {
+        let fresh = state.and_then(|state| {
             let mut parser =
                 utils::create_tool_parser(&self.tool_parser_factory, tool_parser_name, model)?;
-            parser.attach_response_session(session);
+            parser.attach_response_parser_state(state);
             Some(parser)
         });
 
@@ -638,10 +638,10 @@ impl ResponseProcessor {
         // Step 1: Parse reasoning content
         let mut reasoning_text: Option<String> = None;
         let mut processed_text = final_text;
-        let session = messages_request
-            .response_template
+        let state = messages_request
+            .response_parser
             .as_ref()
-            .map(utils::ResponseSessionSeed::session);
+            .map(utils::ResponseParserSpec::new_state);
 
         if reasoning_parser_available {
             // Fresh parser per request: non-streaming extraction keeps no state
@@ -651,8 +651,8 @@ impl ResponseProcessor {
                 reasoning_parser_name.as_deref(),
                 model,
             ) {
-                if let Some(session) = &session {
-                    parser.attach_response_session(session.clone());
+                if let Some(state) = &state {
+                    parser.attach_response_parser_state(state.clone());
                 }
                 // If thinking is effectively ON and template has a toggle, start in reasoning mode.
                 {
@@ -719,7 +719,7 @@ impl ResponseProcessor {
                         tool_parser_name.as_deref(),
                         &messages_request.chat_tools,
                         messages_request.history_tool_calls_count,
-                        session,
+                        state,
                     )
                     .await;
             }

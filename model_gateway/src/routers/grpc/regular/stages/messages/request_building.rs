@@ -145,12 +145,12 @@ impl BuildStage for MessageRequestBuildingStage {
 
         // The response-template parsers start from the end of the prompt.
         let mut spec = MessagesResponseSpec::from(messages_request.as_ref());
-        spec.response_template = ctx
+        spec.response_parser = ctx
             .components
             .parser_resolver
             .response_template(&messages_request.model)
             .map(|template| {
-                utils::ResponseSessionSeed::new(
+                utils::ResponseParserSpec::new(
                     template,
                     &processed_messages.text,
                     &spec.chat_tools,

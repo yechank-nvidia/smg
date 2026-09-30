@@ -84,7 +84,7 @@ pub(crate) struct ChatResponseSpec {
     /// Rendered prompt tokens the provider does not bill; set by request building.
     pub unbilled_prompt_tokens: u32,
     /// Set by request building when a response template selects the parsers.
-    pub response_template: Option<utils::ResponseSessionSeed>,
+    pub response_parser: Option<utils::ResponseParserSpec>,
 }
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
@@ -118,7 +118,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             ignore_eos: request.ignore_eos,
             skip_special_tokens: request.skip_special_tokens,
             unbilled_prompt_tokens: 0,
-            response_template: None,
+            response_parser: None,
         }
     }
 }
@@ -168,7 +168,7 @@ pub(crate) struct MessagesResponseSpec {
     pub chat_tools: Vec<Tool>,
     pub stop_sequences: Option<Vec<String>>,
     /// Set by request building when a response template selects the parsers.
-    pub response_template: Option<utils::ResponseSessionSeed>,
+    pub response_parser: Option<utils::ResponseParserSpec>,
 }
 
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
@@ -186,7 +186,7 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
                 .map(utils::message_utils::extract_chat_tools)
                 .unwrap_or_default(),
             stop_sequences: request.stop_sequences.clone(),
-            response_template: None,
+            response_parser: None,
         }
     }
 }

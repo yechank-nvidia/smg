@@ -1,18 +1,18 @@
 //! Reasoning parser for a tokenizer's response template.
 
-use smg_response_template::{adapter::Session, ResponseTemplate};
+use smg_response_template::{adapter::ResponseParserState, ResponseTemplate};
 
 use crate::traits::{ParseError, ParserResult, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE};
 
 /// Reads the reasoning (`thinking` or `reasoning_content`) and `content`
 /// fields of a response template with the transformers parser of a
-/// [`Session`]. The tool parser of the same output takes the tool calls from
-/// the session. Without an attached session the parser has no prompt, as
-/// transformers with `prefix=""`.
+/// [`ResponseParserState`]. The tool parser of the same output takes the tool
+/// calls from the state. Without an attached state the parser has no prompt,
+/// as transformers with `prefix=""`.
 pub struct TemplateReasoningParser {
     template: ResponseTemplate,
-    session: Option<Session>,
-    /// Bytes fed to the session.
+    state: Option<ResponseParserState>,
+    /// Bytes fed to the parser state.
     fed: usize,
 }
 
@@ -20,14 +20,14 @@ impl TemplateReasoningParser {
     pub fn new(template: ResponseTemplate) -> Self {
         Self {
             template,
-            session: None,
+            state: None,
             fed: 0,
         }
     }
 
-    fn session(&mut self) -> &Session {
-        self.session
-            .get_or_insert_with(|| Session::new(&self.template, "", &[], false))
+    fn state(&mut self) -> &ResponseParserState {
+        self.state
+            .get_or_insert_with(|| ResponseParserState::new(&self.template, "", &[], false))
     }
 
     fn check_size(&mut self, len: usize) -> Result<(), ParseError> {
@@ -52,7 +52,7 @@ fn result(
 impl ReasoningParser for TemplateReasoningParser {
     fn detect_and_parse_reasoning(&mut self, text: &str) -> Result<ParserResult, ParseError> {
         self.check_size(text.len())?;
-        result(self.session().reasoning_complete(text))
+        result(self.state().reasoning_complete(text))
     }
 
     fn parse_reasoning_streaming_incremental(
@@ -60,15 +60,15 @@ impl ReasoningParser for TemplateReasoningParser {
         text: &str,
     ) -> Result<ParserResult, ParseError> {
         self.check_size(text.len())?;
-        result(self.session().reasoning(Some(text)))
+        result(self.state().reasoning(Some(text)))
     }
 
     fn flush(&mut self) -> Result<ParserResult, ParseError> {
-        result(self.session().reasoning(None))
+        result(self.state().reasoning(None))
     }
 
     fn reset(&mut self) {
-        self.session = None;
+        self.state = None;
         self.fed = 0;
     }
 
@@ -83,16 +83,18 @@ impl ReasoningParser for TemplateReasoningParser {
     }
 
     fn is_in_reasoning(&self) -> bool {
-        self.session.as_ref().is_some_and(Session::in_reasoning)
+        self.state
+            .as_ref()
+            .is_some_and(ResponseParserState::in_reasoning)
     }
 
-    /// The session's prompt says where reasoning starts.
+    /// The parser state's prompt says where reasoning starts.
     fn mark_reasoning_started(&mut self) {}
 
     fn mark_think_start_stripped(&mut self) {}
 
-    fn attach_response_session(&mut self, session: Session) {
-        self.session = Some(session);
+    fn attach_response_parser_state(&mut self, state: ResponseParserState) {
+        self.state = Some(state);
     }
 }
 
@@ -135,7 +137,12 @@ mod tests {
     fn the_prompt_decides_where_reasoning_starts() {
         let template = template();
         let mut parser = TemplateReasoningParser::new(template.clone());
-        parser.attach_response_session(Session::new(&template, "<think>\n", &[], false));
+        parser.attach_response_parser_state(ResponseParserState::new(
+            &template,
+            "<think>\n",
+            &[],
+            false,
+        ));
         assert!(parser.is_in_reasoning());
         let chunks = ["plan", " a</thi", "nk>An", "swer<|end|>"];
         assert_eq!(
@@ -144,7 +151,7 @@ mod tests {
         );
         assert!(!parser.is_in_reasoning());
 
-        // Without a session the output starts outside reasoning.
+        // Without a parser state the output starts outside reasoning.
         let mut parser = TemplateReasoningParser::new(template);
         assert_eq!(
             stream(&mut parser, &chunks),
@@ -170,7 +177,7 @@ mod tests {
     fn after_an_error_the_output_passes_through() {
         let template = template();
         let mut parser = TemplateReasoningParser::new(template.clone());
-        parser.attach_response_session(Session::new(&template, "", &[], false));
+        parser.attach_response_parser_state(ResponseParserState::new(&template, "", &[], false));
         let bad = parser.parse_reasoning_streaming_incremental("<call>{</call>");
         assert!(matches!(bad, Err(ParseError::ConfigError(_))));
         let result = parser

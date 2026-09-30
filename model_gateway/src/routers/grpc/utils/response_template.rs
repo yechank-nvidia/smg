@@ -12,7 +12,7 @@ use parking_lot::RwLock;
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, TemplateReasoningParser};
 use serde_json::Value;
 use smg_response_template::{
-    adapter::{self, Session},
+    adapter::{self, ResponseParserState},
     load_response_template, ResponseTemplate,
 };
 use tool_parser::{ParserFactory as ToolParserFactory, TemplateToolParser};
@@ -105,14 +105,14 @@ fn has_float(value: &Value) -> bool {
 /// What the response-template parsers of one request start from: the
 /// rendered prompt after the template's last start anchor, and the tools.
 #[derive(Clone)]
-pub(crate) struct ResponseSessionSeed {
+pub(crate) struct ResponseParserSpec {
     template: ResponseTemplate,
     prompt_tail: Arc<str>,
     tools: Arc<[Value]>,
     continuation: bool,
 }
 
-impl ResponseSessionSeed {
+impl ResponseParserSpec {
     /// `continuation`: the prompt ends inside the assistant message.
     pub(crate) fn new<'a>(
         template: ResponseTemplate,
@@ -131,10 +131,10 @@ impl ResponseSessionSeed {
         }
     }
 
-    /// The session one generated choice's reasoning and tool parsers share.
-    pub(crate) fn session(&self) -> Session {
+    /// The state one generated choice's reasoning and tool parsers share.
+    pub(crate) fn new_state(&self) -> ResponseParserState {
         let tools = &self.tools;
-        Session::new(&self.template, &self.prompt_tail, tools, self.continuation)
+        ResponseParserState::new(&self.template, &self.prompt_tail, tools, self.continuation)
     }
 }
 
