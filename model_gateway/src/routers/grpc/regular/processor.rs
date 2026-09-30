@@ -18,6 +18,7 @@ use openai_protocol::{
     messages::{self, Message},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
+use smg_response_template::adapter::Session;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
 
@@ -106,6 +107,10 @@ impl ResponseProcessor {
         // Step 1: Handle reasoning content parsing
         let mut reasoning_text: Option<String> = None;
         let mut processed_text = final_text;
+        let session = original_request
+            .response_template
+            .as_ref()
+            .map(utils::ResponseSessionSeed::session);
 
         if original_request.separate_reasoning && reasoning_parser_available {
             // Fresh parser per request: non-streaming extraction keeps no state
@@ -115,16 +120,12 @@ impl ResponseProcessor {
                 reasoning_parser_name,
                 model,
             ) {
+                if let Some(session) = &session {
+                    parser.attach_response_session(session.clone());
+                }
                 // If the template injected `<think>` in the prefill (thinking toggle
                 // is supported and effectively ON), start in reasoning mode.
-                if utils::should_mark_reasoning_started(
-                    utils::resolve_user_thinking(
-                        original_request.chat_template_kwargs.as_ref(),
-                        original_request.reasoning_effort.as_deref(),
-                        tokenizer.as_ref(),
-                    ),
-                    tokenizer.as_ref(),
-                ) {
+                if original_request.reasoning_starts_in_prefill(tokenizer.as_ref()) {
                     parser.mark_reasoning_started();
                 }
 
@@ -181,6 +182,7 @@ impl ResponseProcessor {
                         tool_parser_name,
                         original_request.tools.as_deref().unwrap_or(&[]),
                         history_tool_calls_count,
+                        session,
                     )
                     .await;
             }
@@ -195,8 +197,10 @@ impl ResponseProcessor {
             complete.finish_reason()
         };
 
-        // Override finish reason if we have tool calls
-        let final_finish_reason_str = if tool_calls.is_some() {
+        // Parsed calls do not override an engine truncation or failure.
+        let final_finish_reason_str = if tool_calls.is_some()
+            && !matches!(finish_reason_str, "length" | "failed" | "error")
+        {
             "tool_calls"
         } else {
             finish_reason_str
@@ -316,7 +320,8 @@ impl ResponseProcessor {
         }
 
         // Build usage from gRPC response counters.
-        let usage = response_formatting::build_usage(&all_responses);
+        let usage = response_formatting::build_usage(&all_responses)
+            .with_unbilled_prompt_tokens(chat_request.unbilled_prompt_tokens);
 
         // Build final ChatCompletionResponse
         Ok(
@@ -338,15 +343,27 @@ impl ResponseProcessor {
         tool_parser_name: Option<&str>,
         tools: &[Tool],
         history_tool_calls_count: usize,
+        // A response-template session is per request: it needs a fresh parser.
+        session: Option<Session>,
     ) -> (Option<Vec<ToolCall>>, String) {
-        // Get pooled parser for this model
-        let pooled_parser =
-            utils::get_tool_parser(&self.tool_parser_factory, tool_parser_name, model);
+        let fresh = session.and_then(|session| {
+            let mut parser =
+                utils::create_tool_parser(&self.tool_parser_factory, tool_parser_name, model)?;
+            parser.attach_response_session(session);
+            Some(parser)
+        });
 
         // Try parsing directly (parser will handle detection internally). Pass the
         // tool schemas so schema-aware parsers coerce argument types by their
         // declared type instead of guessing from the raw text.
-        let result = {
+        let result = if let Some(parser) = fresh {
+            parser
+                .parse_complete_with_tools(processed_text, tools)
+                .await
+        } else {
+            // Get pooled parser for this model
+            let pooled_parser =
+                utils::get_tool_parser(&self.tool_parser_factory, tool_parser_name, model);
             let parser = pooled_parser.lock().await;
             parser
                 .parse_complete_with_tools(processed_text, tools)
@@ -621,6 +638,10 @@ impl ResponseProcessor {
         // Step 1: Parse reasoning content
         let mut reasoning_text: Option<String> = None;
         let mut processed_text = final_text;
+        let session = messages_request
+            .response_template
+            .as_ref()
+            .map(utils::ResponseSessionSeed::session);
 
         if reasoning_parser_available {
             // Fresh parser per request: non-streaming extraction keeps no state
@@ -630,6 +651,9 @@ impl ResponseProcessor {
                 reasoning_parser_name.as_deref(),
                 model,
             ) {
+                if let Some(session) = &session {
+                    parser.attach_response_session(session.clone());
+                }
                 // If thinking is effectively ON and template has a toggle, start in reasoning mode.
                 {
                     let user_thinking = match &messages_request.thinking {
@@ -695,6 +719,7 @@ impl ResponseProcessor {
                         tool_parser_name.as_deref(),
                         &messages_request.chat_tools,
                         messages_request.history_tool_calls_count,
+                        session,
                     )
                     .await;
             }
@@ -1008,5 +1033,70 @@ mod messages_usage_wire_tests {
         assert_eq!(v["output_tokens"], 150);
         assert_eq!(v["cache_creation_input_tokens"], 0);
         assert_eq!(v["cache_read_input_tokens"], 0);
+    }
+}
+
+#[cfg(test)]
+mod responses_finish_reason_tests {
+    use openai_protocol::chat::ChatCompletionRequest;
+    use smg_grpc_client::tokenspeed_proto::GenerateComplete;
+
+    use super::*;
+
+    #[expect(
+        dead_code,
+        reason = "this shared fixture also supports multi-turn MCP tests"
+    )]
+    mod scripted_tokenizer {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/scripted_tokenizer.rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn parsed_tool_call_preserves_engine_length_finish() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(scripted_tokenizer::ScriptedTokenizer::new(
+            "<tool_call>\n{\"name\":\"user_tool\",\"arguments\":{}}\n</tool_call>",
+        ));
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"test-model","messages":[{"role":"user","content":"call the tool"}],
+            "tools":[{"type":"function","function":{"name":"user_tool","parameters":{"type":"object","properties":{}}}}]
+        })).unwrap();
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        );
+        for (finish, expected) in [("stop", "tool_calls"), ("length", "length")] {
+            let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+                output_ids: vec![100],
+                finish_reason: finish.into(),
+                ..Default::default()
+            });
+            let mut decoder = StopSequenceDecoder::new(
+                tokenizer.clone(),
+                llm_tokenizer::StopSequenceConfig::default(),
+                false,
+            );
+            let choice = processor
+                .process_single_choice(
+                    &complete,
+                    0,
+                    &ChatResponseSpec::from(&request),
+                    "test-model",
+                    &tokenizer,
+                    &mut decoder,
+                    0,
+                    false,
+                    true,
+                    None,
+                    Some("qwen"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(choice.finish_reason.as_deref(), Some(expected));
+            assert_eq!(choice.message.tool_calls.as_ref().unwrap().len(), 1);
+        }
     }
 }

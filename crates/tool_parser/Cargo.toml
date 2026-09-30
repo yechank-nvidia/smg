@@ -1,6 +1,6 @@
 [package]
 name = "tool-parser"
-version = "1.7.0"
+version = "1.8.0"
 edition = "2021"
 description = "Tool/function call parser for LLM model outputs"
 license = "Apache-2.0"
@@ -19,6 +19,7 @@ num-traits.workspace = true
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
+smg-response-template = { workspace = true, features = ["adapter"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros"] }
 tracing.workspace = true

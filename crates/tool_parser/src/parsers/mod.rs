@@ -20,6 +20,7 @@ pub mod passthrough;
 pub mod pythonic;
 pub mod qwen;
 pub mod qwen_xml;
+pub mod response_template;
 pub mod sarashina;
 pub mod step3;
 
@@ -44,5 +45,9 @@ pub(crate) use passthrough::PassthroughParser;
 pub use pythonic::PythonicParser;
 pub use qwen::QwenParser;
 pub use qwen_xml::QwenXmlParser;
+pub use response_template::TemplateToolParser;
 pub use sarashina::SarashinaParser;
 pub use step3::Step3Parser;
+
+pub mod hy_v4;
+pub use hy_v4::HyV4Parser;

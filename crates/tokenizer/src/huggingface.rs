@@ -41,6 +41,8 @@ pub struct HuggingFaceTokenizer {
     vocab: HashMap<String, TokenIdType>,
     reverse_vocab: HashMap<TokenIdType, String>,
     chat_template: ChatTemplateState,
+    /// Raw `response_template` from the sibling tokenizer_config.json.
+    response_template: Option<serde_json::Value>,
     /// EOS token IDs from config.json + generation_config.json
     eos_token_ids: Vec<TokenIdType>,
     /// Which renderer applies chat templates for this model.
@@ -233,6 +235,7 @@ impl HuggingFaceTokenizer {
         // Load tokenizer_config.json once for chat template, add_bos/eos, and special tokens
         let config_result = Self::load_chat_template_and_config(&tokenizer_path.to_string_lossy());
         let mut chat_template_str = config_result.chat_template;
+        let response_template = config_result.response_template;
         let add_bos_token = config_result.add_bos_token;
         let add_eos_token = config_result.add_eos_token;
 
@@ -262,11 +265,18 @@ impl HuggingFaceTokenizer {
             }
         }
 
-        // Load merged EOS token IDs from config.json + generation_config.json
-        let eos_token_ids = tokenizer_path
-            .parent()
-            .map(crate::eos::load_eos_token_ids)
-            .unwrap_or_default();
+        // Load merged EOS token IDs from config.json + generation_config.json,
+        // plus the tokenizer's own eos_token (structured-output grammars end on it).
+        let eos_token_ids = crate::eos::with_tokenizer_eos(
+            tokenizer_path
+                .parent()
+                .map(crate::eos::load_eos_token_ids)
+                .unwrap_or_default(),
+            special_tokens
+                .eos_token
+                .as_deref()
+                .and_then(|token| vocab.get(token).copied()),
+        );
 
         // Detect a custom Python-encoder model from config.json::architectures.
         let renderer = tokenizer_path
@@ -280,6 +290,7 @@ impl HuggingFaceTokenizer {
             vocab,
             reverse_vocab,
             chat_template: ChatTemplateState::new(chat_template_str)?,
+            response_template,
             eos_token_ids,
             renderer,
         })
@@ -348,6 +359,7 @@ impl HuggingFaceTokenizer {
             vocab,
             reverse_vocab,
             chat_template: ChatTemplateState::empty(),
+            response_template: None,
             eos_token_ids: Vec::new(), // No directory path in from_tokenizer
             renderer: Renderer::Jinja,
         }
@@ -426,6 +438,8 @@ impl HuggingFaceTokenizer {
                 .get("chat_template")
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            // Kept raw; parser selection validates it.
+            let response_template = config.get("response_template").cloned();
 
             let add_bos_token = config.get("add_bos_token").and_then(|v| v.as_bool());
             let add_eos_token = config.get("add_eos_token").and_then(|v| v.as_bool());
@@ -448,6 +462,7 @@ impl HuggingFaceTokenizer {
 
             Some(TokenizerConfigResult {
                 chat_template,
+                response_template,
                 add_bos_token,
                 add_eos_token,
                 config_tokens,
@@ -470,6 +485,7 @@ struct ConfigTokens {
 #[derive(Default)]
 struct TokenizerConfigResult {
     chat_template: Option<String>,
+    response_template: Option<serde_json::Value>,
     add_bos_token: Option<bool>,
     add_eos_token: Option<bool>,
     config_tokens: ConfigTokens,
@@ -549,6 +565,10 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         self
     }
 
+    fn response_template(&self) -> Option<&serde_json::Value> {
+        self.response_template.as_ref()
+    }
+
     fn eos_token_ids(&self) -> &[TokenIdType] {
         &self.eos_token_ids
     }
@@ -600,9 +620,8 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             // the native encoder so we must report it directly.
             Renderer::DeepseekV32 | Renderer::DeepseekV4(_) => ThinkingToggle::DefaultOff,
             // V4.1 defaults thinking ON: `reasoning_effort: "none"` or an
-            // explicit `thinking: false` turns it off. vLLM's `enable_thinking`
-            // alias is deliberately ignored by the shim until the gateway
-            // learns it (see `explicit_thinking_v41`).
+            // explicit `thinking: false` (or vLLM's `enable_thinking` alias,
+            // see `renderer_capabilities`) turns it off.
             Renderer::DeepseekV41 => ThinkingToggle::DefaultOn,
             Renderer::Jinja => self.chat_template.thinking_toggle(),
         }
@@ -620,7 +639,17 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         match self.renderer {
             Renderer::DeepseekV4(encoding) => encoding.valid_native_values(),
             Renderer::DeepseekV41 => deepseek_v41::NATIVE_EFFORT_VALUES,
-            Renderer::DeepseekV32 | Renderer::Jinja => &[],
+            Renderer::DeepseekV32 => &[],
+            Renderer::Jinja => self.chat_template.native_reasoning_effort_values(),
+        }
+    }
+
+    fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
+        match self.renderer {
+            // The native DeepSeek renderers switch off on the protocol's
+            // `none`/`minimal`, so they declare no words of their own.
+            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => &[],
+            Renderer::Jinja => self.chat_template.native_reasoning_effort_off_values(),
         }
     }
 
@@ -631,6 +660,23 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             // starts mid-reasoning and the parser must be told so.
             Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => true,
             Renderer::Jinja => self.chat_template.think_in_prefill(),
+        }
+    }
+
+    fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
+        match self.renderer {
+            // The V4.1 shim honours vLLM's `enable_thinking` alias, renders a
+            // trailing assistant message itself when `add_generation_prompt`
+            // is false, and parses tool-call `arguments` strings with the
+            // reference's tolerance.
+            Renderer::DeepseekV41 => crate::traits::RendererCapabilities {
+                enable_thinking_alias: true,
+                native_assistant_continuation: true,
+                raw_tool_call_arguments: true,
+            },
+            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::Jinja => {
+                crate::traits::RendererCapabilities::default()
+            }
         }
     }
 
@@ -858,17 +904,23 @@ fn boolean_kwarg_v41(params: &ChatTemplateParams, key: &str) -> Result<Option<bo
     }
 }
 
-/// V4.1's explicit thinking toggle: `template_kwargs["thinking"]`, the key
-/// this tokenizer reports through `thinking_key_name()` and therefore the only
-/// key the gateway consults when it arms the reasoning parser. Read with the
-/// strict [`boolean_kwarg_v41`] rule.
-///
-/// vLLM's `enable_thinking` alias is deliberately NOT read here: the gateway
-/// does not know the alias yet, so honouring it would render chat mode while
-/// the parser stays armed. Re-enable it together with the gateway-side change
-/// (Task 17) so both sides learn the alias at once.
+/// V4.1's explicit thinking toggle: `template_kwargs["thinking"]` (the key
+/// this tokenizer reports through `thinking_key_name()`) or vLLM's
+/// `enable_thinking` alias, both read with the strict [`boolean_kwarg_v41`]
+/// rule. The gateway reads the same two keys when it arms the reasoning
+/// parser (`renderer_capabilities().enable_thinking_alias`), so the prompt
+/// and the parser never disagree; both present and different is an error.
 fn explicit_thinking_v41(params: &ChatTemplateParams) -> Result<Option<bool>> {
-    boolean_kwarg_v41(params, "thinking")
+    let thinking = boolean_kwarg_v41(params, "thinking")?;
+    let alias = boolean_kwarg_v41(params, "enable_thinking")?;
+    match (thinking, alias) {
+        (Some(a), Some(b)) if a != b => Err(Error::msg(format!(
+            "DeepSeek V4.1: template_kwargs[\"thinking\"] = {a} and \
+             template_kwargs[\"enable_thinking\"] = {b} disagree"
+        ))),
+        (Some(value), _) | (None, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
 }
 
 /// The gateway deserialises a top-level JSON number (`"reasoning_effort": 42`)
@@ -892,10 +944,11 @@ fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_j
 /// message when `add_generation_prompt` is false -> encode.
 ///
 /// `add_generation_prompt: false` with a trailing assistant message is the
-/// encoder's `wo_eos` route (no EOS, no generation header). The gateway does
-/// not send it yet: it renders `continue_final_message` by popping the
-/// trailing assistant message and appending its content after the generation
-/// header; routing that through this shim is a follow-up.
+/// encoder's `wo_eos` route (no EOS, no generation header). The gateway sends
+/// it for `continue_final_message` with a trailing assistant turn because
+/// `renderer_capabilities().native_assistant_continuation` is declared, and
+/// does not arm the reasoning parser for that shape: the message is rendered
+/// past its `</think>`, so the completion starts in content mode.
 ///
 /// The shim reads the merged template kwargs, so an explicit
 /// `chat_template_kwargs.reasoning_effort` wins over the projected top-level
@@ -907,20 +960,23 @@ fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_j
 /// so the rendered prompt and the arming decision agree on every request
 /// shape:
 /// 1. an explicit `template_kwargs["thinking"]` boolean decides;
-/// 2. else the `reasoning_effort` kwarg: `"none"` switches thinking off, a
-///    native effort name (`low`/`high`/`xhigh`/`max`) switches it on, and an
-///    integer budget has no opinion;
-/// 3. else `params.thinking` (the gateway's projection of the top-level
-///    `reasoning_effort`: `Some(false)` for `none`/`minimal`);
+/// 2. else the `reasoning_effort` kwarg: `"none"`/`"minimal"` (the gateway's
+///    thinking switch, `thinking_from_reasoning_effort`) switch thinking off,
+///    a native effort name (`low`/`high`/`xhigh`/`max`) switches it on, and
+///    an integer budget has no opinion;
+/// 3. else `params.thinking` (the gateway's projection of the typed
+///    `thinking.type` toggle, else `Some(false)` for a `none`/`minimal`
+///    effective `reasoning_effort`);
 /// 4. else on ([`ThinkingToggle::DefaultOn`]).
 ///
 /// Deliberate divergence from vLLM's Python: there `reasoning_effort: "none"`
 /// forces chat mode even over an explicit `thinking: true`. Here the explicit
 /// toggle wins, because the gateway arms the reasoning parser from the
 /// explicit toggle first, and rendering chat mode for that contradictory input
-/// would have the armed parser swallow the whole answer as reasoning. `"none"`
-/// still never reaches `parse_reasoning_effort` (which rejects it) and leaves
-/// the effort unset, so a thinking-mode prompt carries the default budget.
+/// would have the armed parser swallow the whole answer as reasoning. Neither
+/// switch value reaches `parse_reasoning_effort` (which rejects both, as the
+/// reference does) and both leave the effort unset, so a thinking-mode prompt
+/// carries the default budget.
 fn apply_deepseek_v41(
     messages: &[serde_json::Value],
     params: &ChatTemplateParams,
@@ -937,8 +993,9 @@ fn apply_deepseek_v41(
         .template_kwargs
         .and_then(|k| k.get("reasoning_effort"));
     let effort_name = effort_kwarg.and_then(serde_json::Value::as_str);
-    // `"none"` is a thinking switch, not an effort level.
-    let effort_is_none = effort_name == Some("none");
+    // `"none"`/`"minimal"` are the gateway's thinking switch (both project to
+    // thinking off everywhere else in SMG), not effort levels.
+    let effort_is_none = matches!(effort_name, Some("none") | Some("minimal"));
     let reasoning_effort = if effort_is_none {
         None
     } else {
@@ -1001,13 +1058,70 @@ fn apply_deepseek_v41(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, fs};
+
+    use serde_json::json;
+    use tempfile::TempDir;
 
     use super::derive_thinking_mode;
-    use crate::{chat_template::ChatTemplateParams, encoders::deepseek_v32::ThinkingMode};
+    use crate::{
+        chat_template::ChatTemplateParams, encoders::deepseek_v32::ThinkingMode,
+        traits::Tokenizer as _, HuggingFaceTokenizer,
+    };
+
+    const MIN_TOKENIZER_JSON: &str = r#"{
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": { "type": "Whitespace" },
+        "post_processor": null,
+        "decoder": null,
+        "model": {
+            "type": "BPE",
+            "vocab": { "hello": 0 },
+            "merges": []
+        }
+    }"#;
 
     fn thinking_kwargs(value: bool) -> HashMap<String, serde_json::Value> {
         HashMap::from([("thinking".to_string(), serde_json::Value::Bool(value))])
+    }
+
+    #[test]
+    fn response_template_is_retained_from_tokenizer_config() {
+        let temp = TempDir::new().unwrap();
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        fs::write(&tokenizer_path, MIN_TOKENIZER_JSON).unwrap();
+        let expected = json!({
+            "defaults": {"thinking": "", "content": "", "tool_calls": []},
+            "start_anchor_pattern": "anchor",
+            "fields": {"sentinel": "raw-value-is-not-rewritten"}
+        });
+        fs::write(
+            temp.path().join("tokenizer_config.json"),
+            json!({"response_template": expected}).to_string(),
+        )
+        .unwrap();
+
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        assert_eq!(tokenizer.response_template(), Some(&expected));
+    }
+
+    #[test]
+    fn tokenizer_without_response_template_reports_none() {
+        let temp = TempDir::new().unwrap();
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        fs::write(&tokenizer_path, MIN_TOKENIZER_JSON).unwrap();
+        fs::write(
+            temp.path().join("tokenizer_config.json"),
+            json!({"chat_template": "{{ messages }}"}).to_string(),
+        )
+        .unwrap();
+
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        assert_eq!(tokenizer.response_template(), None);
     }
 
     // Regression: DeepSeek V3.2/V4 bypass ChatTemplateState::apply, so the

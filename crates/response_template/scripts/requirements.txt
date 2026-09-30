@@ -1,0 +1,2 @@
+transformers==5.17.0
+regex==2026.9.10

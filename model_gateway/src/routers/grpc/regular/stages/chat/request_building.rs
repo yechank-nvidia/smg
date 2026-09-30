@@ -13,7 +13,10 @@ use crate::routers::{
             AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
             PreparationOutput, RequestContext,
         },
-        multimodal::{assemble_multimodal_data, assemble_multimodal_data_after_encode},
+        multimodal::{
+            assemble_media_refs, assemble_multimodal_data, assemble_multimodal_data_after_encode,
+            reserve_multimodal_inflight,
+        },
         spec::{ChatResponseSpec, ResponseSpec},
         utils,
     },
@@ -101,17 +104,30 @@ pub(crate) async fn build_chat_backed_plan(
     } else {
         None
     };
-
-    let require_reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
-        utils::should_mark_reasoning_started(
-            utils::resolve_user_thinking(
-                chat_request.chat_template_kwargs.as_ref(),
-                chat_request.reasoning_effort.as_deref(),
-                tokenizer.as_ref(),
-            ),
-            tokenizer.as_ref(),
+    if let Some(data) = multimodal_data.as_ref() {
+        ctx.state.multimodal_inflight = reserve_multimodal_inflight(
+            ctx.components
+                .multimodal
+                .as_ref()
+                .and_then(|multimodal| multimodal.inflight.as_deref()),
+            data.inline_bytes(),
         )
-    });
+        .await?;
+    }
+
+    // A structural tag that already opens with the reasoning block runs from
+    // the first token; asking SGLang to also defer the grammar past `</think>`
+    // would make the model owe a second one.
+    let require_reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
+        utils::chat_reasoning_starts_in_prefill(chat_request, tokenizer.as_ref())
+    }) && !utils::constraint_covers_reasoning(
+        &ctx.components.tool_parser_factory,
+        ctx.components
+            .parser_resolver
+            .tool_parser(&chat_request.model)
+            .as_deref(),
+        tool_constraints.as_ref(),
+    );
 
     let mut proto_request = builder_client
         .build_chat_request(
@@ -163,6 +179,23 @@ pub(crate) async fn build_chat_backed_plan(
         helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
     }
 
+    // Worker-side multimodal processing: attach the media references now that
+    // the wire is known, before the PD clone so both legs carry them.
+    if let Some(plan) = ctx.state.multimodal_refs.take() {
+        if builder_client.is_zmq() {
+            return Err(error::bad_request(
+                "multimodal_not_supported",
+                "media references require a gRPC vLLM worker",
+            ));
+        }
+        let refs =
+            assemble_media_refs(plan).map_err(|e| error::bad_request(e.code(), e.to_string()))?;
+        proto_request
+            .set_vllm_media_refs(refs)
+            .map_err(|e| error::bad_request("multimodal_not_supported", e))?;
+        ctx.state.media_refs_forwarded = true;
+    }
+
     Ok((
         ExecutionPlan::generate(plan_kind, proto_request),
         AttemptStamp {
@@ -201,6 +234,20 @@ impl BuildStage for ChatRequestBuildingStage {
             ));
         };
 
+        let unbilled_prompt_tokens = processed_messages.unbilled_prompt_tokens;
+        // The response-template parsers start from the end of the prompt.
+        let response_template = ctx
+            .components
+            .parser_resolver
+            .response_template(&chat_request.model)
+            .map(|template| {
+                utils::ResponseSessionSeed::new(
+                    template,
+                    &processed_messages.text,
+                    chat_request.effective_tools(),
+                    utils::continues_final_assistant(&chat_request),
+                )
+            });
         let (plan, stamp) = build_chat_backed_plan(
             ctx,
             &chat_request,
@@ -213,9 +260,15 @@ impl BuildStage for ChatRequestBuildingStage {
         )
         .await?;
 
+        // Only the client-facing usage drops them; settlement keeps the engine's count.
+        ctx.state.response.unbilled_prompt_tokens = unbilled_prompt_tokens;
+        let mut spec = ChatResponseSpec::from(chat_request.as_ref());
+        spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
+        spec.response_template = response_template;
+
         Ok(BuildOutput {
             plan,
-            spec: ResponseSpec::Chat(Box::new(ChatResponseSpec::from(chat_request.as_ref()))),
+            spec: ResponseSpec::Chat(Box::new(spec)),
             stamp,
         })
     }

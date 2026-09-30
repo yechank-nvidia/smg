@@ -17,8 +17,8 @@ use tracing::{debug, info, warn};
 use super::{
     get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
-    BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig,
-    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
+    normalize_model_key, BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy,
+    ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
 };
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
@@ -77,7 +77,7 @@ pub struct PolicyRegistry {
 
     /// Shared sticky selector for the routing-key override. `Some` when the
     /// override is enabled; consulted (instead of the configured policy) for keyed
-    /// requests via [`PolicyRegistry::select_worker`].
+    /// requests via [`PolicyRegistry::select_worker_for_model`].
     routing_key_sticky: Option<Arc<ManualPolicy>>,
 
     /// Ordered routing-key header names, parsed once from
@@ -123,7 +123,7 @@ impl PolicyRegistry {
     }
 
     /// Create a PolicyRegistry. When `routing_key_override.enabled`, builds a shared
-    /// sticky selector consulted for keyed requests in [`Self::select_worker`].
+    /// sticky selector consulted for keyed requests in [`Self::select_worker_for_model`].
     pub fn with_override(
         default_policy_config: PolicyConfig,
         routing_key_override: RoutingKeyOverrideConfig,
@@ -253,20 +253,37 @@ impl PolicyRegistry {
     /// `consistent_hashing`, which read `rid_key` and the header themselves
     /// with the same rid-first precedence). Otherwise delegates to `policy`.
     /// `policy.name()` stays the real policy (for metrics).
-    pub fn select_worker(
+    pub fn select_worker_for_model(
         &self,
         policy: &Arc<dyn LoadBalancingPolicy>,
+        model_id: &str,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
         if let Some(sticky) = self.routing_key_sticky.as_ref() {
             if Self::routing_key_override_applies(policy.name()) {
                 if let Some((key, source)) = self.effective_sticky_key(info) {
-                    return Self::select_sticky(sticky, policy, workers, info, key, source);
+                    return Self::select_sticky(
+                        sticky, policy, model_id, workers, info, key, source,
+                    );
                 }
             }
         }
         policy.select_worker(workers, info)
+    }
+
+    #[cfg(test)]
+    fn select_worker(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        let model_id = workers
+            .first()
+            .map(|worker| worker.model_id())
+            .unwrap_or(crate::worker::UNKNOWN_MODEL_ID);
+        self.select_worker_for_model(policy, model_id, workers, info)
     }
 
     /// Keyed selection: honor an existing pin under the in-flight cap;
@@ -275,6 +292,7 @@ impl PolicyRegistry {
     fn select_sticky(
         sticky: &Arc<ManualPolicy>,
         policy: &Arc<dyn LoadBalancingPolicy>,
+        model_id: &str,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
         key: &str,
@@ -282,17 +300,20 @@ impl PolicyRegistry {
     ) -> Option<usize> {
         Metrics::record_routing_key_source(source);
 
-        // Keyed-load guards track the un-namespaced key on each worker.
+        // WorkerLoadGuard records the raw session key, so the cap must query
+        // that same key. Model/leg-scoped cap accounting is a separate contract.
         let load_key = key;
 
-        // PD legs namespace so prefill and decode stick independently.
-        let namespaced;
-        let key = if info.leg == WorkerLeg::Single {
-            key
-        } else {
-            namespaced = format!("{}{}", info.leg.routing_id_prefix(), key);
-            &namespaced
+        // Models and PD legs stick independently while sharing one bounded map.
+        // Length-prefix the model so delimiters in model IDs cannot cross fields.
+        let model = normalize_model_key(model_id);
+        let leg = match info.leg {
+            WorkerLeg::Single => 's',
+            WorkerLeg::Prefill => 'p',
+            WorkerLeg::Decode => 'd',
         };
+        let namespaced = format!("{}:{model}:{leg}:{key}", model.len());
+        let key = namespaced.as_str();
 
         let over_cap =
             |idx: usize| workers[idx].routing_key_inflight(load_key) >= STICKY_INFLIGHT_CAP;
@@ -501,22 +522,32 @@ impl PolicyRegistry {
             model_id
         );
 
-        // Inject and publish under the integration guards so a concurrent
-        // setter cannot fall between them: it either wrote before the reads
-        // here, or its propagation scan runs after the insert and finds
-        // this policy.
-        {
-            let monitor = self.kv_event_monitor.read();
-            let load_rx = self.load_rx.read();
-            let mesh = self.mesh_tree_sync.read();
-            Self::maybe_inject_monitor(&policy, monitor.as_ref());
-            Self::maybe_inject_load_rx(&policy, load_rx.as_ref());
-            Self::maybe_inject_mesh_tree_sync(&policy, mesh.as_ref());
+        self.publish_with_shared_state(&policy, || {
             self.model_policies
                 .insert(model_id.to_string(), Arc::clone(&policy));
-        }
+        });
 
         policy
+    }
+
+    /// Hand `policy` the shared state a cache-aware policy consumes (the KV
+    /// event monitor, the backend load feed, the mesh tree bridge), then run
+    /// `publish` while the three guards are still held. Holding them across
+    /// the publish is what makes this race-free against the setters: a
+    /// setter either wrote before these reads, or its propagation scan runs
+    /// after `publish` and finds the policy in place.
+    fn publish_with_shared_state(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        publish: impl FnOnce(),
+    ) {
+        let monitor = self.kv_event_monitor.read();
+        let load_rx = self.load_rx.read();
+        let mesh = self.mesh_tree_sync.read();
+        Self::maybe_inject_monitor(policy, monitor.as_ref());
+        Self::maybe_inject_load_rx(policy, load_rx.as_ref());
+        Self::maybe_inject_mesh_tree_sync(policy, mesh.as_ref());
+        publish();
     }
 
     /// Called when a worker is removed
@@ -677,11 +708,18 @@ impl PolicyRegistry {
         self.model_worker_counts.clear();
     }
 
-    /// Set the prefill policy for PD mode (lock-free, set once at startup)
+    /// Set the prefill policy for PD mode (set once at startup).
+    ///
+    /// The router factory sets the prefill leg after the app context wired the
+    /// KV event monitor, the load feed and the mesh tree bridge into the
+    /// registry, and those setters only reach policies that already exist,
+    /// so the leg takes that state here, under the shared-state read guards.
     pub fn set_prefill_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
-        // OnceLock::set returns Err if already set, which we ignore since
-        // the policy should only be set once at startup
-        let _ = self.prefill_policy.set(policy);
+        self.publish_with_shared_state(&policy, || {
+            // OnceLock::set returns Err if already set, which we ignore since
+            // the policy should only be set once at startup
+            let _ = self.prefill_policy.set(Arc::clone(&policy));
+        });
     }
 
     pub fn set_dp_rank_policy(&self, policy: Arc<dyn DPRankLoadPolicy>) {
@@ -695,18 +733,32 @@ impl PolicyRegistry {
         self.dp_rank_policy.get().map(Arc::clone)
     }
 
-    /// Set the decode policy for PD mode (lock-free, set once at startup)
+    /// Set the decode policy for PD mode (set once at startup).
+    ///
+    /// The router factory sets the decode leg after the app context wired the
+    /// KV event monitor, the load feed and the mesh tree bridge into the
+    /// registry, and those setters only reach policies that already exist,
+    /// so the leg takes that state here, under the shared-state read guards.
     pub fn set_decode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
-        // OnceLock::set returns Err if already set, which we ignore since
-        // the policy should only be set once at startup
-        let _ = self.decode_policy.set(policy);
+        self.publish_with_shared_state(&policy, || {
+            // OnceLock::set returns Err if already set, which we ignore since
+            // the policy should only be set once at startup
+            let _ = self.decode_policy.set(Arc::clone(&policy));
+        });
     }
 
-    /// Set the encode policy for EPD mode (lock-free, set once at startup)
+    /// Set the encode policy for EPD mode (set once at startup).
+    ///
+    /// The router factory sets the encode leg after the app context wired the
+    /// KV event monitor, the load feed and the mesh tree bridge into the
+    /// registry, and those setters only reach policies that already exist,
+    /// so the leg takes that state here, under the shared-state read guards.
     pub fn set_encode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
-        // OnceLock::set returns Err if already set, which we ignore since
-        // the policy should only be set once at startup
-        let _ = self.encode_policy.set(policy);
+        self.publish_with_shared_state(&policy, || {
+            // OnceLock::set returns Err if already set, which we ignore since
+            // the policy should only be set once at startup
+            let _ = self.encode_policy.set(Arc::clone(&policy));
+        });
     }
 
     /// Get the prefill policy for PD mode, or default if not set (lock-free)
@@ -982,12 +1034,16 @@ impl std::fmt::Debug for PolicyRegistry {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::HealthCheckConfig;
+    use tokio::sync::watch;
     use tracing_test::traced_test;
 
     use super::*;
     use crate::{
         policies::{CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
-        worker::{BasicWorkerBuilder, HashRing, Worker, WorkerLoadGuard, WorkerType},
+        worker::{
+            load_state::LoadSnapshot, BasicWorkerBuilder, HashRing, Worker, WorkerLoadGuard,
+            WorkerType,
+        },
     };
 
     fn no_health_check() -> HealthCheckConfig {
@@ -1056,6 +1112,45 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(reg.select_worker(&policy, &workers, &info), Some(first));
         }
+    }
+
+    #[test]
+    fn routing_key_override_keeps_model_pins_independent() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                assignment_mode: ManualAssignmentMode::Delegate,
+                ..Default::default()
+            },
+        );
+        let policy = reg.get_default_policy();
+        let pools = [
+            vec![
+                worker("http://a1", WorkerType::Regular),
+                worker("http://a2", WorkerType::Regular),
+            ],
+            vec![worker("http://b1", WorkerType::Regular)],
+            vec![worker("http://c1", WorkerType::Regular)],
+        ];
+        let info = SelectWorkerInfo {
+            rid_key: Some("session-42"),
+            ..Default::default()
+        };
+
+        let first_a = reg
+            .select_worker_for_model(&policy, "model-a", &pools[0], &info)
+            .unwrap();
+        reg.select_worker_for_model(&policy, "model-b", &pools[1], &info)
+            .unwrap();
+        reg.select_worker_for_model(&policy, "model-c", &pools[2], &info)
+            .unwrap();
+
+        assert_eq!(
+            reg.select_worker_for_model(&policy, "model-a", &pools[0], &info),
+            Some(first_a),
+            "other models must not consume this model's bounded failover slots"
+        );
     }
 
     /// `--routing-key-override` means the same thing under every policy:
@@ -2069,6 +2164,55 @@ mod tests {
             }
             registry.set_kv_event_monitor(None);
             registry.clear();
+        }
+    }
+
+    /// The PD/EPD legs are set after the app context wired the shared state
+    /// into the registry (the KV event monitor, the load feed, and the mesh
+    /// tree bridge that `MeshAdapters::start` attaches), so the leg setters
+    /// hand all of it over themselves.
+    #[tokio::test]
+    async fn pd_leg_policies_receive_the_shared_state_set_before_them() {
+        use std::collections::BTreeMap;
+
+        use smg_mesh::MeshKV;
+
+        use crate::{mesh::MeshAdapters, worker::WorkerRegistry};
+
+        let registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        registry.set_kv_event_monitor(Some(Arc::new(KvEventMonitor::new(Some(4)))));
+        let (_load_tx, load_rx) = watch::channel(LoadSnapshot::from_loads_for_test(Vec::new()));
+        registry.set_load_receiver(Some(load_rx));
+        let mesh = MeshKV::new("node-a".into());
+        let _adapters = MeshAdapters::start(
+            &mesh,
+            "node-a".into(),
+            Arc::new(WorkerRegistry::new()),
+            Arc::new(RwLock::new(BTreeMap::new())),
+            Arc::clone(&registry),
+        );
+
+        let prefill = cache_aware_policy();
+        let decode = cache_aware_policy();
+        let encode = cache_aware_policy();
+        registry.set_prefill_policy(Arc::clone(&prefill));
+        registry.set_decode_policy(Arc::clone(&decode));
+        registry.set_encode_policy(Arc::clone(&encode));
+
+        for (leg, policy) in [("prefill", prefill), ("decode", decode), ("encode", encode)] {
+            let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap();
+            assert!(
+                cache_aware.kv_event_monitor_is_set_for_test(),
+                "{leg} leg missed the KV event monitor"
+            );
+            assert!(
+                cache_aware.has_load_receiver_for_test(),
+                "{leg} leg missed the load feed"
+            );
+            assert!(
+                cache_aware.should_populate_hash_index_for_test(),
+                "{leg} leg missed the mesh tree bridge"
+            );
         }
     }
 

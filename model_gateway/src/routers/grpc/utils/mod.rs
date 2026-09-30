@@ -5,6 +5,7 @@ mod logprobs;
 pub(crate) mod message_utils;
 mod metrics;
 mod parsers;
+mod response_template;
 pub(crate) mod tonic_ext;
 
 // Re-export all public items so consumer imports stay unchanged.
@@ -20,10 +21,14 @@ pub(crate) use logprobs::{
     convert_proto_to_openai_logprobs,
 };
 pub(crate) use metrics::{error_type_from_status, route_to_endpoint};
+// `pub` (not `pub(crate)`) so the Go bindings can reuse the gateway's arming
+// predicate instead of duplicating it.
+pub use parsers::chat_reasoning_starts_in_prefill;
 pub(crate) use parsers::{
-    check_reasoning_parser_availability, check_tool_parser_availability, create_reasoning_parser,
-    create_tool_parser, get_tool_parser, reasoning_parser_requires_special_tokens, ParserResolver,
+    check_reasoning_parser_availability, check_tool_parser_availability,
+    constraint_covers_reasoning, continues_final_assistant, create_reasoning_parser,
+    create_tool_parser, get_tool_parser, messages_reasoning_starts_in_prefill,
+    reasoning_parser_requires_special_tokens, reasoning_starts_in_prefill,
+    should_mark_reasoning_started, ParserResolver,
 };
-// `pub` (not `pub(crate)`) so the Go bindings can reuse the gateway's reasoning
-// detection instead of duplicating it.
-pub use parsers::{resolve_user_thinking, should_mark_reasoning_started};
+pub(crate) use response_template::{ResponseSessionSeed, ResponseTemplateParsers};

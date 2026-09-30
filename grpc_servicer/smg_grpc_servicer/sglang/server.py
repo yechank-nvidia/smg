@@ -33,6 +33,7 @@ from smg_grpc_servicer.sglang.scheduler_launcher import (
     launch_scheduler_process_only,
     terminate_scheduler_processes,
 )
+from smg_grpc_servicer.sglang.scheduler_watchdog import wait_for_scheduler_shutdown
 from smg_grpc_servicer.sglang.servicer import SGLangSchedulerServicer
 
 logger = logging.getLogger(__name__)
@@ -123,7 +124,7 @@ async def serve_grpc(
     # This ensures the bootstrap server is ready when prefill schedulers try to register
     bootstrap_server = None
     if server_args.disaggregation_mode == "prefill":
-        bootstrap_server = start_disagg_service(server_args)
+        bootstrap_server = start_disagg_service()
         if bootstrap_server:
             logger.info(
                 "Bootstrap server started for disaggregation mode on %s:%s",
@@ -379,7 +380,7 @@ async def serve_grpc(
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, signal_handler)
 
-        await stop_event.wait()
+        await wait_for_scheduler_shutdown(scheduler_procs, stop_event)
     finally:
         logger.info("Shutting down gRPC server")
 

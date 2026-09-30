@@ -84,11 +84,15 @@ fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
 }
 
 fn complete(index: u32, reason: &str) -> proto::GenerateResponse {
+    complete_with_prompt(index, reason, 1)
+}
+
+fn complete_with_prompt(index: u32, reason: &str, prompt_tokens: u32) -> proto::GenerateResponse {
     proto::GenerateResponse {
         response: Some(GenerationEvent::Complete(proto::GenerateComplete {
             index,
             finish_reason: reason.to_string(),
-            prompt_tokens: 1,
+            prompt_tokens,
             completion_tokens: 12,
             ..Default::default()
         })),
@@ -164,6 +168,7 @@ fn processor(with_tools: bool) -> StreamingProcessor {
             Arc::new(WorkerRegistry::new()),
             with_tools.then(|| "json".to_string()),
             Some("qwen3".to_string()),
+            None,
         ),
         "vllm",
     )
@@ -319,6 +324,80 @@ async fn chat_stream_error_does_not_flush_a_success_tail() {
 }
 
 #[tokio::test]
+async fn chat_usage_chunk_excludes_unbilled_prompt_tokens() {
+    for (unbilled, continuous) in [(0, false), (3, false), (0, true), (3, true)] {
+        let mut first = chunk(0, "hi");
+        if let Some(GenerationEvent::Chunk(chunk)) = &mut first.response {
+            chunk.prompt_tokens = 10;
+            chunk.cached_tokens = 10;
+        }
+        let mut last = complete_with_prompt(0, "stop", 10);
+        if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
+            complete.cached_tokens = 10;
+        }
+        let (stream, server) = scripted_stream(vec![first, last], "0").await;
+        let (tx, rx) = sse_channel();
+        let request = serde_json::json!({
+            "model": "eof-test", "messages": [], "stream": true,
+            "stream_options": {"include_usage": true, "continuous_usage_stats": continuous}
+        });
+        let mut spec = ChatResponseSpec::from(
+            &serde_json::from_value::<ChatCompletionRequest>(request).expect("chat request"),
+        );
+        spec.unbilled_prompt_tokens = unbilled;
+        let result = processor(false)
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+
+        let final_event = events.last().expect("final usage event");
+        assert!(final_event["choices"].as_array().unwrap().is_empty());
+        let usage = &final_event["usage"];
+        for event in &events[..events.len() - 1] {
+            let snapshot = &event["usage"];
+            if continuous {
+                assert_eq!(snapshot["prompt_tokens"], 10 - unbilled, "{event}");
+                assert_eq!(
+                    snapshot["prompt_tokens_details"]["cached_tokens"],
+                    10 - unbilled
+                );
+                assert_eq!(
+                    snapshot["total_tokens"].as_u64().unwrap(),
+                    u64::from(10 - unbilled) + snapshot["completion_tokens"].as_u64().unwrap()
+                );
+                if !event["choices"][0]["finish_reason"].is_null() {
+                    assert_eq!(snapshot, usage, "finish and final usage must agree");
+                }
+            } else {
+                assert!(snapshot.is_null(), "{event}");
+            }
+        }
+        assert!(events
+            .iter()
+            .any(|event| event["choices"][0]["delta"]["content"] == "hi"));
+        assert!(events
+            .iter()
+            .any(|event| event["choices"][0]["finish_reason"] == "stop"));
+        assert_eq!(usage["prompt_tokens"], 10 - unbilled);
+        assert_eq!(
+            usage["total_tokens"],
+            usage["prompt_tokens"].as_u64().unwrap() + usage["completion_tokens"].as_u64().unwrap()
+        );
+    }
+}
+
+#[tokio::test]
 async fn messages_eof_emits_thinking_tail_before_block_stop() {
     for send_complete in [true, false] {
         let mut responses = vec![chunk(0, "<think>first"), chunk(0, "</thi")];
@@ -337,6 +416,7 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
             history_tool_calls_count: 0,
             chat_tools: Vec::new(),
             stop_sequences: None,
+            response_template: None,
         };
         let result = processor(false)
             .process_messages_streaming_chunks(
@@ -384,4 +464,381 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
             }
         );
     }
+}
+
+#[tokio::test]
+async fn deepseek_usage_rides_on_the_last_finish_chunk() {
+    for options in [
+        serde_json::json!(null),
+        serde_json::json!({"include_usage": false}),
+        serde_json::json!({"include_usage": true}),
+        serde_json::json!({"include_usage": true, "continuous_usage_stats": true}),
+    ] {
+        for (choices, unbilled) in [(1, 0), (2, 3)] {
+            let mut frames = Vec::new();
+            for index in 0..choices {
+                frames.push(chunk(index, "<think>reason</think>answer<thi"));
+                let mut final_frame = complete_with_prompt(index, "length", 10);
+                if let Some(GenerationEvent::Complete(complete)) = &mut final_frame.response {
+                    complete.cached_tokens = 8;
+                    complete.completion_tokens = 31;
+                }
+                frames.push(final_frame);
+            }
+            let (stream, server) = scripted_stream(frames, "0").await;
+            let (tx, rx) = sse_channel();
+            let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "deepseek-flash", "messages": [], "stream": true, "n": choices,
+                "stream_options": options, "separate_reasoning": true
+            }))
+            .unwrap();
+            let mut spec = ChatResponseSpec::from(&req);
+            spec.unbilled_prompt_tokens = unbilled;
+            let result = processor(false)
+                .process_streaming_chunks(
+                    stream,
+                    dispatch(),
+                    Arc::new(CharacterTokenizer::default()),
+                    (None, None, false, false, false),
+                    spec,
+                    &tx,
+                    None,
+                )
+                .await;
+            drop(tx);
+            let events = collect_events(rx).await;
+            server.abort();
+            assert!(result.is_ok(), "{result:?}");
+            assert!(events.len() > 2, "{events:?}");
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["choices"].as_array().unwrap().len() == 1),
+                "no usage-only chunk: {events:?}"
+            );
+            let last = events.last().unwrap();
+            assert_eq!(last["choices"][0]["finish_reason"], "length");
+            assert!(last["choices"][0]["delta"]["content"].is_null());
+            assert_eq!(last["usage"]["prompt_tokens"], 10 - unbilled);
+            assert_eq!(last["usage"]["completion_tokens"], 31 * choices);
+            assert_eq!(last["usage"]["total_tokens"], 10 - unbilled + 31 * choices);
+            assert_eq!(
+                last["usage"]["prompt_tokens_details"]["cached_tokens"],
+                8.min(10 - unbilled)
+            );
+            assert!(last["usage"]["completion_tokens_details"]["reasoning_tokens"].is_null());
+            for event in &events[..events.len() - 1] {
+                if options["include_usage"] == true {
+                    assert_eq!(event.get("usage"), Some(&Value::Null), "{event}");
+                } else {
+                    assert!(event.get("usage").is_none(), "{event}");
+                }
+            }
+            for index in 0..choices {
+                assert_eq!(chat_text(&events, index, "content"), "answer<thi");
+                assert_eq!(chat_text(&events, index, "reasoning_content"), "reason");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn deepseek_does_not_emit_aggregate_usage_without_complete_frames() {
+    for (status, partial) in [("0", false), ("13", false), ("0", true)] {
+        let mut frames = vec![chunk(0, "hello")];
+        if partial {
+            frames.extend([complete(0, "stop"), chunk(1, "unfinished")]);
+        }
+        let (stream, server) = scripted_stream(frames, status).await;
+        let (tx, rx) = sse_channel();
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "deepseek-flash", "messages": [], "stream": true, "n": if partial {2} else {1},
+            "stream_options": {"include_usage": true}
+        }))
+        .unwrap();
+        let result = processor(false)
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                ChatResponseSpec::from(&req),
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert_eq!(result.is_ok(), status == "0");
+        assert!(!events.is_empty());
+        assert!(
+            events
+                .iter()
+                .all(|event| event.get("usage") == Some(&Value::Null)),
+            "{events:?}"
+        );
+    }
+}
+
+/// Reports one whole call, name included, only when the output ends.
+struct CallAtEnd;
+
+#[async_trait::async_trait]
+impl ToolParser for CallAtEnd {
+    async fn parse_complete(
+        &self,
+        output: &str,
+    ) -> tool_parser::errors::ParserResult<(String, Vec<tool_parser::ToolCall>)> {
+        Ok((output.to_string(), Vec::new()))
+    }
+
+    async fn parse_incremental(
+        &mut self,
+        _chunk: &str,
+        _tools: &[Tool],
+    ) -> tool_parser::errors::ParserResult<StreamingParseResult> {
+        Ok(StreamingParseResult::default())
+    }
+
+    fn has_tool_markers(&self, _text: &str) -> bool {
+        false
+    }
+
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
+        Some(vec![ToolCallItem {
+            tool_index: 0,
+            name: Some("lookup".to_string()),
+            parameters: "{}".to_string(),
+        }])
+    }
+}
+
+#[tokio::test]
+async fn chat_eof_starts_a_call_a_parser_reports_at_the_end() {
+    let tools = ToolParserFactory::new();
+    tools
+        .registry()
+        .register_parser("call-at-end", || Box::new(CallAtEnd));
+    let resolver = utils::ParserResolver::new(
+        Arc::new(WorkerRegistry::new()),
+        Some("call-at-end".to_string()),
+        None,
+        None,
+    );
+    let processor = StreamingProcessor::new(tools, ReasoningParserFactory::new(), resolver, "vllm");
+    let mut spec = chat_spec(true);
+    spec.expected_choices = 1;
+    let (stream, server) = scripted_stream(vec![chunk(0, "x"), complete(0, "stop")], "0").await;
+    let (tx, rx) = sse_channel();
+    let result = processor
+        .process_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            (None, None, false, false, false),
+            spec,
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    let calls: Vec<&Value> = events
+        .iter()
+        .filter_map(|event| event["choices"][0]["delta"]["tool_calls"].get(0))
+        .collect();
+    assert_eq!(calls.len(), 1, "{events:?}");
+    assert_eq!(calls[0]["type"], "function");
+    assert_eq!(calls[0]["function"]["name"], "lookup");
+    assert_eq!(calls[0]["function"]["arguments"], "{}");
+    assert!(calls[0]["id"].as_str().is_some_and(|id| !id.is_empty()));
+    let finish = events.last().unwrap()["choices"][0]["finish_reason"].clone();
+    assert_eq!(finish, "tool_calls");
+}
+
+/// Reasoning for every chunk but "text"; `is_in_reasoning` reports `.0`.
+struct ReasoningButText(bool);
+
+impl ReasoningParser for ReasoningButText {
+    fn detect_and_parse_reasoning(
+        &mut self,
+        text: &str,
+    ) -> Result<ParserResult, reasoning_parser::ParseError> {
+        Ok(ParserResult::normal(text.to_string()))
+    }
+
+    fn parse_reasoning_streaming_incremental(
+        &mut self,
+        text: &str,
+    ) -> Result<ParserResult, reasoning_parser::ParseError> {
+        Ok(match text {
+            "text" => ParserResult::normal(text.to_string()),
+            _ => ParserResult::reasoning(text.to_string()),
+        })
+    }
+
+    fn reset(&mut self) {}
+
+    fn model_type(&self) -> &str {
+        "reasoning-but-text"
+    }
+
+    fn is_in_reasoning(&self) -> bool {
+        self.0
+    }
+
+    fn mark_reasoning_started(&mut self) {}
+
+    fn mark_think_start_stripped(&mut self) {}
+}
+
+/// Reports one whole call on its first chunk, before the chunk's text.
+#[derive(Default)]
+struct CallFirst {
+    called: bool,
+}
+
+#[async_trait::async_trait]
+impl ToolParser for CallFirst {
+    async fn parse_complete(
+        &self,
+        output: &str,
+    ) -> tool_parser::errors::ParserResult<(String, Vec<tool_parser::ToolCall>)> {
+        Ok((output.to_string(), Vec::new()))
+    }
+
+    async fn parse_incremental(
+        &mut self,
+        chunk: &str,
+        _tools: &[Tool],
+    ) -> tool_parser::errors::ParserResult<StreamingParseResult> {
+        let calls = (!std::mem::replace(&mut self.called, true)).then(|| ToolCallItem {
+            tool_index: 0,
+            name: Some("lookup".to_string()),
+            parameters: "{}".to_string(),
+        });
+        Ok(StreamingParseResult {
+            normal_text: chunk.to_string(),
+            calls: calls.into_iter().collect(),
+        })
+    }
+
+    fn has_tool_markers(&self, _text: &str) -> bool {
+        false
+    }
+}
+
+/// The content block starts and stops of a Messages stream of `texts`.
+async fn messages_blocks(
+    in_reasoning: bool,
+    tool_choice: Option<messages::ToolChoice>,
+    texts: &[&str],
+) -> Vec<String> {
+    let reasoning = ReasoningParserFactory::new();
+    reasoning
+        .registry()
+        .register_parser("reasoning-but-text", move || {
+            Box::new(ReasoningButText(in_reasoning))
+        });
+    let tools = ToolParserFactory::new();
+    tools
+        .registry()
+        .register_parser("call-first", || Box::new(CallFirst::default()));
+    let resolver = utils::ParserResolver::new(
+        Arc::new(WorkerRegistry::new()),
+        Some("call-first".to_string()),
+        Some("reasoning-but-text".to_string()),
+        None,
+    );
+    let processor = StreamingProcessor::new(tools, reasoning, resolver, "vllm");
+    let spec = MessagesResponseSpec {
+        thinking: Some(messages::ThinkingConfig::Enabled {
+            budget_tokens: 1024,
+            display: None,
+        }),
+        tool_choice,
+        has_tools: true,
+        history_tool_calls_count: 0,
+        chat_tools: chat_spec(true).tools.unwrap(),
+        stop_sequences: None,
+        response_template: None,
+    };
+    let mut frames: Vec<_> = texts.iter().map(|text| chunk(0, text)).collect();
+    frames.push(complete(0, "stop"));
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let (tx, rx) = sse_channel();
+    let result = processor
+        .process_messages_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            (None, None, false, false, false),
+            spec,
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    events
+        .iter()
+        .filter_map(|event| match event["type"].as_str()? {
+            "content_block_start" => Some(format!(
+                "start {} {}",
+                event["index"], event["content_block"]["type"]
+            )),
+            "content_block_stop" => Some(format!("stop {}", event["index"])),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn messages_blocks_do_not_overlap_when_reasoning_calls_and_text_alternate() {
+    // Reasoning, then a call with no text between; text; reasoning again.
+    assert_eq!(
+        messages_blocks(false, None, &["a", "text", "b"]).await,
+        [
+            "start 0 \"thinking\"",
+            "stop 0",
+            "start 1 \"tool_use\"",
+            "stop 1",
+            "start 2 \"text\"",
+            "stop 2",
+            "start 3 \"thinking\"",
+            "stop 3",
+        ]
+    );
+    // Text the reasoning parser returns while it stays in reasoning, as when
+    // one chunk ends reasoning, adds text and starts reasoning again.
+    assert_eq!(
+        messages_blocks(true, None, &["a", "text", "b"]).await,
+        [
+            "start 0 \"thinking\"",
+            "stop 0",
+            "start 1 \"text\"",
+            "stop 1",
+            "start 2 \"thinking\"",
+            "stop 2",
+        ]
+    );
+    // A specific tool right after reasoning.
+    let tool = messages::ToolChoice::Tool {
+        name: "lookup".to_string(),
+        disable_parallel_tool_use: None,
+    };
+    assert_eq!(
+        messages_blocks(false, Some(tool), &["a"]).await,
+        [
+            "start 0 \"thinking\"",
+            "stop 0",
+            "start 1 \"tool_use\"",
+            "stop 1",
+        ]
+    );
 }

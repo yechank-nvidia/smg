@@ -21,8 +21,10 @@ from .constants import (
     ENV_SHOW_WORKER_LOGS,
     HEALTH_CHECK_INTERVAL,
     LAUNCH_STAGGER_DELAY,
+    MM_PROCESSING_WORKER,
     ConnectionMode,
     WorkerType,
+    get_mm_processing,
     get_runtime,
     get_zmq_engine_count,
     sglang_transfer_backend,
@@ -68,6 +70,8 @@ class Worker:
     # (a deployment-injected SMG_PAIRING_PROTOCOL, for instance).
     extra_env: dict[str, str] | None = None
     process: subprocess.Popen | None = field(default=None, repr=False)
+    # Where the engine's output lands when it is not shown on the terminal.
+    log_path: str | None = field(default=None, repr=False)
     _log_file: IO[Any] | None = field(default=None, repr=False)
     # Used memory per GPU just before launch; ``stop`` waits for it to come back.
     _gpu_mem_baseline: dict[int, int] | None = field(default=None, repr=False)
@@ -498,7 +502,6 @@ class Worker:
                 cmd.append("--enable-prefix-caching")
             if self.worker_type == WorkerType.PREFILL:
                 cmd.append("--enforce-eager")
-            cmd.append("--skip-server-warmup")
 
         extra = spec.get("tokenspeed_args", [])
         if extra:
@@ -544,6 +547,15 @@ class Worker:
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpu_ids))
+
+        if (
+            self.engine == "vllm"
+            and self.mode == ConnectionMode.GRPC
+            and get_mm_processing() == MM_PROCESSING_WORKER
+        ):
+            # The worker advertises mm_processor and the gateway, left in auto
+            # mode, forwards media references instead of preprocessed tensors.
+            env["SMG_VLLM_MM_PROCESSOR"] = "inprocess"
 
         if self.engine == "tokenspeed" and self.worker_type in (
             WorkerType.ENCODE,
@@ -618,6 +630,13 @@ class Worker:
             env.update(self.extra_env)
         return env
 
+    def read_log(self) -> str:
+        """The engine's captured output so far; empty when it goes to the terminal."""
+        if self.log_path is None:
+            return ""
+        with open(self.log_path, encoding="utf-8", errors="replace") as log:
+            return log.read()
+
     def _spawn_process(self, cmd: list[str], env: dict[str, str]) -> subprocess.Popen:
         """Spawn the worker subprocess with output routing."""
         show_output = os.environ.get(ENV_SHOW_WORKER_LOGS, "0") == "1"
@@ -635,6 +654,7 @@ class Worker:
             else:
                 log_path = os.path.join(tempfile.gettempdir(), f"smg-worker-{safe_name}.log")
             self._log_file = open(log_path, "w", encoding="utf-8")
+            self.log_path = log_path
             stdout_target = self._log_file
             stderr_target = subprocess.STDOUT
 

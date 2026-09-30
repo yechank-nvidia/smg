@@ -4,7 +4,8 @@ use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use axum::response::Response;
 use futures::future::{join_all, try_join_all};
-use tracing::{debug, error, info_span, Instrument};
+use smg_grpc_client::vllm_proto as vllm;
+use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
     helpers::{maybe_inject_pd_metadata, maybe_inject_pd_rendezvous},
@@ -19,6 +20,7 @@ use crate::{
                 KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
             },
             pd_admission,
+            retry::mark_non_retryable,
         },
         error,
         grpc::{
@@ -27,6 +29,7 @@ use crate::{
                 ClientSelection, DispatchContext, ExecutionPlan, ExecutionPlanKind,
                 ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
             },
+            multimodal::worker_language_model_only,
             proto_wrapper::{
                 FanoutStream, ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest,
                 ProtoResponseVariant, ProtoStream,
@@ -142,11 +145,53 @@ fn plan_sub_requests(plan: &ExecutionPlan, workers: Option<&WorkerSelection>) ->
 /// read, so it cannot be handed to n prefills; those requests keep the
 /// single dispatch.
 fn pd_fanout_width(request: &ProtoGenerateRequest, protocol: PdProtocol) -> Option<u32> {
-    if protocol.dispatch != PdDispatch::Parallel || request.has_mm_inputs() {
+    if protocol.dispatch != PdDispatch::Parallel
+        || request.has_mm_inputs()
+        || request.has_vllm_media_refs()
+    {
         return None;
     }
     let n = request.sampling_n();
     (n > 1).then_some(n)
+}
+
+/// Give the decode leg the media identity the prefill leg produced, so it
+/// is served without pixels or references. Only on a leg that will pull its
+/// prompt KV from prefill: it must hold a KV handoff (`handed_off`) and be
+/// a single-sample request (`relay_kv_params`); with n>1 decode recomputes
+/// the prompt and needs the references itself, even where legacy Mooncake
+/// still injects its host and port, and a pixel-less leg without KV is
+/// refused by the servicer. A prefill that was asked for an identity
+/// (`solicited`: its request carried KV params) but returned none is an
+/// older servicer; the leg is left as it is, and decode reprocesses the
+/// media.
+fn apply_prefill_media_identity(
+    decode_request: &mut ProtoGenerateRequest,
+    handed_off: bool,
+    relay_kv_params: bool,
+    solicited: bool,
+    identity: Option<&vllm::MediaIdentity>,
+) {
+    if !handed_off || !relay_kv_params || !decode_request.has_vllm_media_refs() {
+        return;
+    }
+    let applied = match identity {
+        Some(identity) => decode_request.apply_media_identity(identity),
+        None if solicited => {
+            warn!(
+                request_id = %decode_request.request_id(),
+                "prefill worker returned no media identity; decode leg will reprocess media"
+            );
+            return;
+        }
+        None => return,
+    };
+    if !applied {
+        warn!(
+            request_id = %decode_request.request_id(),
+            "prefill worker's media identity is unusable; decode leg will reprocess media"
+        );
+    }
 }
 
 /// Split an n>1 request into `n` single-sample sub-requests. Sub `i` carries
@@ -189,9 +234,14 @@ fn pd_leg_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 /// Dispatch one attempt of the retained plan: create the attempt's load
 /// guards, fan out encode jobs on the first EPD dispatch, and store the
 /// execution result on the context for response processing.
+///
+/// `last_attempt` says whether a plan is still retained for a replay, which
+/// is what decides when the media bytes stop counting against the in-flight
+/// budget.
 pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     execution_plan: ExecutionPlan,
+    last_attempt: bool,
 ) -> Result<(), Response> {
     // One bootstrap room per backend request the plan will post: a batched
     // completion fans out one PD dispatch per sub-request, so admission has
@@ -291,7 +341,14 @@ pub(crate) async fn execute_plan(
         }
     }
     .instrument(span)
-    .await?;
+    .await;
+    // The engines hold the request bodies now. An earlier attempt keeps its
+    // share of the budget: the retained plan still owns the same media, and a
+    // replay would send it again.
+    if last_attempt {
+        ctx.multimodal_inflight.take();
+    }
+    let result = result?;
 
     // Store result in context for response processing
     ctx.response.execution_result = Some(result);
@@ -515,14 +572,36 @@ async fn execute_single(
     workers.record_outcome(result.cb_status_code());
 
     let stream = result.map_err(|e| {
-        error!(function = "execute_single", error = %e, "Failed to start generation");
-        e.to_http_error(
+        start_failure_response(
+            &e,
+            "execute_single",
+            "Failed to start generation",
             "start_generation_failed",
-            format!("Failed to start generation: {}", e.message()),
         )
     })?;
 
     Ok(ExecutionResult::Single { stream })
+}
+
+/// Client answer for a request the worker did not start; an engine rejection (4xx) is not a fault.
+fn start_failure_response(
+    e: &tonic::Status,
+    function: &'static str,
+    description: &str,
+    code: &str,
+) -> Response {
+    if e.http_status().is_client_error() {
+        warn!(function = function, error = %e, "{}: engine rejected the request", description);
+    } else {
+        error!(function = function, error = %e, "{}", description);
+    }
+    let mut response = e.to_http_error(code, format!("{description}: {}", e.message()));
+    // The worker already spent its whole media-sidecar budget on this input;
+    // another attempt costs the same again. Other sidecar failures fail fast.
+    if e.code() == tonic::Code::Unavailable && e.message().starts_with("sidecar_timeout") {
+        mark_non_retryable(&mut response);
+    }
+    response
 }
 
 async fn execute_single_embed(
@@ -545,10 +624,11 @@ async fn execute_single_embed(
     workers.record_outcome(result.cb_status_code());
 
     let complete = result.map_err(|e| {
-        error!(function = "execute_single_embed", error = %e, "Failed to start embedding");
-        e.to_http_error(
+        start_failure_response(
+            &e,
+            "execute_single_embed",
+            "Failed to start embedding",
             "start_embedding_failed",
-            format!("Failed to start embedding: {}", e.message()),
         )
     })?;
 
@@ -749,17 +829,11 @@ async fn dispatch_pd_legs(
 /// Log, count and translate one leg's dispatch failure into the client answer.
 fn pd_leg_error(leg: PdLeg, connection: &'static str, error: &tonic::Status) -> Response {
     Metrics::record_worker_error(leg.name(), connection, metrics_labels::ERROR_BACKEND);
-    match leg {
-        PdLeg::Prefill => {
-            error!(function = "execute_parallel_pd", error = %error, "Prefill worker failed to start");
-        }
-        PdLeg::Decode => {
-            error!(function = "execute_parallel_pd", error = %error, "Decode worker failed to start");
-        }
-    }
-    error.to_http_error(
+    start_failure_response(
+        error,
+        "execute_parallel_pd",
+        leg.error_message(),
         leg.error_code(),
-        format!("{}: {}", leg.error_message(), error.message()),
     )
 }
 
@@ -806,6 +880,80 @@ fn retire_pd_leg(
             }
         }
     });
+}
+
+/// How the vLLM sequential-PD decode leg is built from the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequentialPdDecodeForm {
+    /// Full payload: no KV handoff (n>1), decode recomputes the prompt
+    /// locally and runs the vision encoder itself.
+    Full,
+    /// Pixels dropped, per-image identity and M-RoPE grid tensors kept:
+    /// decode computes grid-aware positions against the KV handoff.
+    IdentityOnly,
+    /// Language-model-only decode worker: everything multimodal goes except
+    /// the per-image content hashes (folded into cache_salt servicer-side),
+    /// so the engine sees a pure-text TokensPrompt and never touches its
+    /// zero-budget encoder cache.
+    TextPlusHashes,
+}
+
+/// Pick the decode-leg form, failing fast when the selected decode worker is
+/// language-model-only and the request is one that pairing cannot serve.
+fn sequential_pd_decode_form(
+    request: &ProtoGenerateRequest,
+    decode_language_model_only: bool,
+    relay_kv_params: bool,
+) -> Result<SequentialPdDecodeForm, Response> {
+    if !decode_language_model_only {
+        return Ok(if relay_kv_params {
+            SequentialPdDecodeForm::IdentityOnly
+        } else {
+            SequentialPdDecodeForm::Full
+        });
+    }
+    if request.has_vllm_mrope_grids() {
+        // Grid-dependent models (Qwen-VL family) derive decode-side positions
+        // from the grid tensors: a language-model-only decode worker rejects
+        // them and stripping them would mis-rotate every generated token, so
+        // this pairing cannot serve the request.
+        let mut response = error::bad_request(
+            "pd_decode_language_model_only_mrope",
+            "the selected decode worker runs with --language-model-only, but this \
+             model's decode leg needs its M-RoPE grid tensors; run the decode pool \
+             with the vision encoder enabled for this model"
+                .to_string(),
+        );
+        mark_non_retryable(&mut response);
+        return Err(response);
+    }
+    if request.has_vllm_media_refs() {
+        // Media references reach each leg as unexpanded anchors the leg
+        // expands itself; a language-model-only decode worker cannot.
+        let mut response = error::bad_request(
+            "pd_decode_language_model_only_media_refs",
+            "the selected decode worker runs with --language-model-only and cannot \
+             expand media references; use router-side multimodal processing \
+             (--mm-processing=router) for this pool"
+                .to_string(),
+        );
+        mark_non_retryable(&mut response);
+        return Err(response);
+    }
+    if !relay_kv_params && request.has_mm_inputs() {
+        // n>1 has no KV handoff: decode recomputes the prompt locally, which
+        // a pixel-less decode worker cannot do.
+        let mut response = error::bad_request(
+            "pd_decode_language_model_only_n_samples",
+            "the selected decode worker runs with --language-model-only and cannot \
+             recompute a multimodal prompt; n>1 parallel sampling needs decode \
+             workers with the vision encoder enabled"
+                .to_string(),
+        );
+        mark_non_retryable(&mut response);
+        return Err(response);
+    }
+    Ok(SequentialPdDecodeForm::TextPlusHashes)
 }
 
 /// Execute vLLM PD: send to prefill with max_tokens=1 first, wait for completion,
@@ -892,14 +1040,36 @@ async fn execute_sequential_pd(
     // 0.13. The pixel-free leg is the clone, so pixel tensors are never
     // duplicated and die with the prefill send; the per-image mm identity
     // and grid tensors survive for decode-side hashing and positions.
+    // Media references are resolved by the prefill leg and relayed to
+    // decode as that same identity once prefill completes.
     // Without a KV handoff (n>1) decode recomputes the prompt locally and
     // must run the vision encoder, so that leg keeps the full multimodal
     // payload (SHM-backed tensors cannot serve both legs and fail loudly
     // on the decode read).
-    let mut decode_request = if relay_kv_params {
-        proto_request.clone_without_mm_pixels()
-    } else {
-        proto_request.clone()
+    //
+    // A decode worker started with `--language-model-only` (the production
+    // vLLM P/D shape — Dynamo pairs the same way) has no vision encoder and
+    // an encoder-cache budget of 0, so even the identity payload fails to
+    // schedule there. Its model info reports supports_vision=false; for such
+    // a worker the decode leg is stripped down to the Dynamo contract: the
+    // prefill-expanded input_ids, the KV handoff, and the per-image content
+    // hashes that the servicer folds into cache_salt so different images
+    // cannot alias in the decode prefix cache.
+    let decode_language_model_only = proto_request.is_vllm()
+        && workers
+            .decode_worker()
+            .is_some_and(|worker| worker_language_model_only(worker.as_ref()));
+    let decode_form =
+        sequential_pd_decode_form(&proto_request, decode_language_model_only, relay_kv_params)?;
+    // A stripped multimodal leg has no local-recompute fallback: the image
+    // KV exists only on the prefill worker. Text requests strip to a no-op
+    // and keep the fallback, so only mm requests need the handoff checked.
+    let stripped_mm_decode = matches!(decode_form, SequentialPdDecodeForm::TextPlusHashes)
+        && proto_request.has_mm_inputs();
+    let mut decode_request = match decode_form {
+        SequentialPdDecodeForm::Full => proto_request.clone(),
+        SequentialPdDecodeForm::TextPlusHashes => proto_request.clone_without_mm(),
+        SequentialPdDecodeForm::IdentityOnly => proto_request.clone_without_mm_pixels(),
     };
     // Sanitize prefill sampling (max_tokens=1, n=1), stream=false.
     let mut prefill_request = proto_request;
@@ -932,27 +1102,36 @@ async fn execute_sequential_pd(
     let (prefill_label, decode_label) = pd_leg_labels(workers);
     let prefill_start = Instant::now();
     let mut prefill_stream = prefill_client
-            .generate(prefill_request)
-            .await
-            .map_err(|e| {
-                workers.record_outcome_prefill(e.http_status().as_u16());
-                Metrics::record_worker_error(
-                    metrics_labels::WORKER_PREFILL,
-                    prefill_label,
-                    metrics_labels::ERROR_BACKEND,
-                );
-                error!(function = "execute_sequential_pd", error = %e, "Prefill worker failed to start");
-                e.to_http_error("prefill_worker_failed_to_start", format!("Prefill worker failed to start: {}", e.message()))
-            })?;
+        .generate(prefill_request)
+        .await
+        .map_err(|e| {
+            workers.record_outcome_prefill(e.http_status().as_u16());
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_PREFILL,
+                prefill_label,
+                metrics_labels::ERROR_BACKEND,
+            );
+            start_failure_response(
+                &e,
+                "execute_sequential_pd",
+                PdLeg::Prefill.error_message(),
+                PdLeg::Prefill.error_code(),
+            )
+        })?;
 
-    // Drain prefill response, harvesting connector params from the Complete frame
+    // Drain prefill response, harvesting connector params and the processed
+    // media identity from the Complete frame
     let mut prefill_kv_params: Option<String> = None;
+    let mut prefill_media_identity: Option<vllm::MediaIdentity> = None;
     while let Some(result) = prefill_stream.next().await {
         match result {
             Ok(response) => {
                 if let ProtoResponseVariant::Complete(complete) = response.into_response() {
                     if let Some(json) = complete.kv_transfer_params_json() {
                         prefill_kv_params = Some(json.to_owned());
+                    }
+                    if let Some(identity) = complete.media_identity() {
+                        prefill_media_identity = Some(identity.clone());
                     }
                 }
             }
@@ -984,6 +1163,11 @@ async fn execute_sequential_pd(
     if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
         decode_request.set_data_parallel_rank(rank as i32);
     }
+    // The prefill request carried KV params, so the servicer was asked for
+    // the media identity; and whether decode ends up holding a handoff.
+    let identity_solicited =
+        mooncake_transfer_id.is_some() || (mode == KvConnectorMode::Nixl && relay_kv_params);
+    let mut handed_off = false;
     match (&mode, prefill_kv_params) {
         // Modern Mooncake: synthesized params under the minted transfer_id
         (
@@ -1006,6 +1190,7 @@ async fn execute_sequential_pd(
                 host,
                 *port,
             ));
+            handed_off = true;
         }
         // Legacy Mooncake (no engine_id discovered, or n>1): typed host/port injection
         (KvConnectorMode::Mooncake { host, port, .. }, _) => {
@@ -1015,6 +1200,7 @@ async fn execute_sequential_pd(
                 "vLLM PD: injecting kv_transfer_params into decode request"
             );
             decode_request.set_kv_transfer_params(host.clone(), *port);
+            handed_off = true;
         }
         (KvConnectorMode::Nixl | KvConnectorMode::Passthrough, Some(json)) if relay_kv_params => {
             debug!(
@@ -1023,6 +1209,7 @@ async fn execute_sequential_pd(
                 "vLLM PD: relaying prefill kv_transfer_params to decode request"
             );
             decode_request.set_kv_transfer_params_json(json);
+            handed_off = true;
         }
         (KvConnectorMode::Nixl, None) if relay_kv_params => {
             Metrics::record_pd_kv_transfer_failure();
@@ -1035,6 +1222,35 @@ async fn execute_sequential_pd(
         }
         _ => {}
     }
+    apply_prefill_media_identity(
+        &mut decode_request,
+        handed_off,
+        relay_kv_params,
+        identity_solicited,
+        prefill_media_identity.as_ref(),
+    );
+
+    // A stripped multimodal leg cannot fall back to a local recompute: the
+    // image KV exists only on the prefill worker, so without a handoff the
+    // decode engine would recompute the prompt as pure text and answer
+    // image-blind. Fail instead of dispatching.
+    if stripped_mm_decode && !decode_request.has_kv_transfer_params() {
+        error!(
+            function = "execute_sequential_pd",
+            request_id = %decode_request.request_id(),
+            "stripped multimodal decode leg has no kv_transfer_params to pull from"
+        );
+        let mut response = error::bad_gateway(
+            "pd_decode_missing_kv_transfer_params",
+            "the prefill worker returned no kv_transfer_params for this multimodal \
+             request, and the language-model-only decode worker cannot recompute the \
+             prompt locally (outdated smg-grpc-servicer or missing kv-transfer-config \
+             on the prefill worker?)"
+                .to_string(),
+        );
+        mark_non_retryable(&mut response);
+        return Err(response);
+    }
 
     // Send request to decode
     let decode_stream = decode_client.generate(decode_request).await.map_err(|e| {
@@ -1044,10 +1260,11 @@ async fn execute_sequential_pd(
             decode_label,
             metrics_labels::ERROR_BACKEND,
         );
-        error!(function = "execute_sequential_pd", error = %e, "Decode worker failed to start");
-        e.to_http_error(
-            "decode_worker_failed_to_start",
-            format!("Decode worker failed to start: {}", e.message()),
+        start_failure_response(
+            &e,
+            "execute_sequential_pd",
+            PdLeg::Decode.error_message(),
+            PdLeg::Decode.error_code(),
         )
     })?;
 
@@ -1116,6 +1333,78 @@ mod tests {
             decode: leg("grpc://decode:30000", WorkerType::Decode),
             runtime_type: RuntimeType::TokenSpeed,
         }
+    }
+
+    #[test]
+    fn engine_rejections_at_start_are_4xx_under_the_same_error_code() {
+        let rejected = start_failure_response(
+            &tonic::Status::invalid_argument("Invalid grammar specification"),
+            "execute_single",
+            "Failed to start generation",
+            "start_generation_failed",
+        );
+        assert_eq!(rejected.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            rejected
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "start_generation_failed"
+        );
+
+        let failed = start_failure_response(
+            &tonic::Status::internal("engine died"),
+            "execute_single",
+            "Failed to start generation",
+            "start_generation_failed",
+        );
+        assert_eq!(failed.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            failed
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "start_generation_failed"
+        );
+    }
+
+    #[test]
+    fn a_spent_sidecar_budget_is_not_retried_but_a_fast_sidecar_failure_is() {
+        use crate::routers::common::retry::is_retryable_response;
+
+        let start = |status: tonic::Status| {
+            start_failure_response(
+                &status,
+                "execute_single",
+                "Failed to start generation",
+                "start_generation_failed",
+            )
+        };
+
+        let timed_out = start(tonic::Status::unavailable(
+            "sidecar_timeout: no result for job ef684cf9 within 300000 ms",
+        ));
+        assert_eq!(timed_out.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!is_retryable_response(&timed_out));
+
+        for message in [
+            "sidecar_overloaded: 8 jobs queued (cap 8)",
+            "sidecar_unavailable: connection refused",
+            "sidecar_protocol: undecodable result",
+            "sidecar_push_failed: ConnectionResetError: reset",
+            "worker is saturated",
+        ] {
+            let failed = start(tonic::Status::unavailable(message));
+            assert_eq!(failed.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert!(is_retryable_response(&failed), "{message}");
+        }
+
+        // The prefix is the worker's; the same words under another code mean something else.
+        let rejected = start(tonic::Status::invalid_argument(
+            "sidecar_timeout mentioned in a client error",
+        ));
+        assert_eq!(rejected.status(), http::StatusCode::BAD_REQUEST);
+        assert!(!is_retryable_response(&rejected));
     }
 
     #[test]
@@ -1388,6 +1677,205 @@ mod tests {
     }
 
     #[test]
+    fn clone_without_mm_pixels_keeps_vllm_media_refs() {
+        // The clone keeps the references; on the sequential path they are
+        // replaced by the prefill leg's identity before decode is sent.
+        let refs = vllm::MediaRefs {
+            items: vec![vllm::MediaRef {
+                modality: smg_grpc_client::common_proto::Modality::Image as i32,
+                url: "https://a/1.png".to_string(),
+            }],
+        };
+        let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: "pd-refs".to_string(),
+            ..Default::default()
+        }));
+        request
+            .set_vllm_media_refs(refs.clone())
+            .expect("vLLM request accepts media refs");
+        assert!(request.has_vllm_media_refs());
+        let clone = request.clone_without_mm_pixels();
+        let ProtoGenerateRequest::Vllm(decode) = clone else {
+            panic!("expected vLLM clone");
+        };
+        assert_eq!(decode.media_refs, Some(refs));
+        assert!(decode.mm_inputs.is_none());
+    }
+
+    fn media_refs_request(id: &str, n: u32) -> ProtoGenerateRequest {
+        let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: id.to_string(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    original_text: "describe <|image|>".to_string(),
+                    input_ids: vec![7, 8, 9],
+                },
+            )),
+            sampling_params: Some(vllm::SamplingParams {
+                n,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        request
+            .set_vllm_media_refs(vllm::MediaRefs {
+                items: vec![vllm::MediaRef {
+                    modality: smg_grpc_client::common_proto::Modality::Image as i32,
+                    url: "https://a/1.png".to_string(),
+                }],
+            })
+            .expect("vLLM request accepts media refs");
+        request
+    }
+
+    fn identity() -> vllm::MediaIdentity {
+        vllm::MediaIdentity {
+            prompt_token_ids: vec![7, 8, 100, 100, 100, 9],
+            mm_inputs: Some(vllm::MultimodalInputs {
+                mm_hashes: vec!["h1".to_string(), "h2".to_string()],
+                mm_placeholders: vec![
+                    vllm::PlaceholderRange {
+                        offset: 2,
+                        length: 2,
+                    },
+                    vllm::PlaceholderRange {
+                        offset: 4,
+                        length: 1,
+                    },
+                ],
+                model_specific_tensors: std::collections::HashMap::from([(
+                    "image_grid_thw".to_string(),
+                    vllm::TensorData {
+                        shape: vec![2, 3],
+                        dtype: "int64".to_string(),
+                        payload: Some(vllm::tensor_data::Payload::Inline(vec![0; 48])),
+                    },
+                )]),
+                batched_keys: vec!["image_grid_thw".to_string()],
+                modality: smg_grpc_client::common_proto::Modality::Image as i32,
+                ..Default::default()
+            }),
+            extra_mm_inputs: vec![],
+        }
+    }
+
+    /// A media_refs request under parallel PD dispatch would otherwise become
+    /// n pairs, each processing the media on both legs.
+    #[test]
+    fn media_refs_request_never_fans_out() {
+        let sglang = PdProtocol::for_runtime(RuntimeType::Sglang).unwrap();
+        assert_eq!(sglang.dispatch, PdDispatch::Parallel);
+        assert_eq!(pd_fanout_width(&media_refs_request("fan", 3), sglang), None);
+    }
+
+    /// Without a KV handoff decode recomputes the prompt locally, so it needs
+    /// the media itself and the identity must not replace its references:
+    /// n>1 never relays, and a NIXL prefill that returned no params does not
+    /// hand off either, even when it did return an identity.
+    #[test]
+    fn n_greater_than_one_keeps_media_refs_on_decode() {
+        let mut decode = media_refs_request("n2", 2).clone_without_mm_pixels();
+        apply_prefill_media_identity(&mut decode, false, false, false, Some(&identity()));
+        assert!(decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.mm_inputs.is_none());
+    }
+
+    /// Legacy Mooncake injects its host and port into every decode leg, n>1
+    /// included, so `handed_off` alone does not say that decode will pull
+    /// its prompt KV from prefill: an n>1 leg recomputes locally and keeps
+    /// its references whatever the prefill returned.
+    #[test]
+    fn n_greater_than_one_keeps_media_refs_despite_a_legacy_mooncake_handoff() {
+        let mut decode = media_refs_request("n2-mooncake", 2).clone_without_mm_pixels();
+        apply_prefill_media_identity(&mut decode, true, false, false, Some(&identity()));
+        assert!(decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.mm_inputs.is_none());
+    }
+
+    #[test]
+    fn an_identity_without_a_kv_handoff_keeps_the_references() {
+        let mut decode = media_refs_request("no-kv", 1).clone_without_mm_pixels();
+        apply_prefill_media_identity(&mut decode, false, true, true, Some(&identity()));
+        assert!(decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.mm_inputs.is_none());
+    }
+
+    #[test]
+    fn decode_leg_from_media_identity_has_no_refs_and_no_pixels() {
+        let mut decode = media_refs_request("relay", 1).clone_without_mm_pixels();
+        apply_prefill_media_identity(&mut decode, true, true, true, Some(&identity()));
+        assert!(!decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.media_refs.is_none());
+        let mm = request.mm_inputs.as_ref().expect("identity mm_inputs");
+        assert!(mm.pixel_values.is_none());
+        assert_eq!(mm.mm_hashes.len(), 2);
+        assert_eq!(mm.mm_placeholders.len(), 2);
+        assert!(mm.model_specific_tensors.contains_key("image_grid_thw"));
+        let Some(vllm::generate_request::Input::Tokenized(tokenized)) = &request.input else {
+            panic!("expected tokenized input");
+        };
+        assert_eq!(tokenized.input_ids, vec![7, 8, 100, 100, 100, 9]);
+        assert_eq!(tokenized.original_text, "describe <|image|>");
+    }
+
+    /// An identity the leg cannot take, empty ids or a leg that is not
+    /// tokenized, leaves the references in place: better a reprocessed
+    /// decode than an empty prompt.
+    #[test]
+    fn an_unusable_identity_leaves_the_decode_leg_untouched() {
+        let mut empty = identity();
+        empty.prompt_token_ids.clear();
+        let mut decode = media_refs_request("empty", 1).clone_without_mm_pixels();
+        apply_prefill_media_identity(&mut decode, true, true, true, Some(&empty));
+        assert!(decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.mm_inputs.is_none());
+
+        let mut decode = media_refs_request("text", 1).clone_without_mm_pixels();
+        if let ProtoGenerateRequest::Vllm(request) = &mut decode {
+            request.input = Some(vllm::generate_request::Input::Text(
+                "describe <|image|>".to_string(),
+            ));
+        }
+        apply_prefill_media_identity(&mut decode, true, true, true, Some(&identity()));
+        assert!(decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.mm_inputs.is_none());
+        assert!(matches!(
+            request.input,
+            Some(vllm::generate_request::Input::Text(_))
+        ));
+    }
+
+    /// An older servicer returns no identity: the decode leg keeps its
+    /// references and reprocesses, as before; the same when no identity was
+    /// asked for (a prefill request without KV params).
+    #[test]
+    fn missing_identity_leaves_the_decode_leg_untouched() {
+        for solicited in [true, false] {
+            let mut decode = media_refs_request("old", 1).clone_without_mm_pixels();
+            apply_prefill_media_identity(&mut decode, true, true, solicited, None);
+            assert!(decode.has_vllm_media_refs(), "solicited={solicited}");
+        }
+    }
+
+    #[test]
     fn clone_without_mm_pixels_keeps_vllm_identity_and_grid_tensors() {
         // The decode leg drops the pixel tensors but keeps the per-image
         // identity and the inline M-RoPE grid tensors.
@@ -1407,7 +1895,10 @@ mod tests {
                     ("aspect_ratios".to_string(), grid.clone()),
                     // Flat-classified grid keys keep their sizes tensor.
                     ("second_per_grid_ts".to_string(), grid.clone()),
-                    ("ts_sizes".to_string(), grid),
+                    ("ts_sizes".to_string(), grid.clone()),
+                    // The Omni family's and the router's own spelling of the
+                    // video timing.
+                    ("video_second_per_grid".to_string(), grid),
                 ]),
                 flat_keys: std::collections::HashMap::from([(
                     "second_per_grid_ts".to_string(),
@@ -1441,7 +1932,7 @@ mod tests {
             original_mm.pixel_values.is_some(),
             "prefill leg keeps pixels"
         );
-        assert_eq!(original_mm.model_specific_tensors.len(), 5);
+        assert_eq!(original_mm.model_specific_tensors.len(), 6);
         assert_eq!(original_mm.batched_keys.len(), 3);
         let decode_mm = decode.mm_inputs.expect("decode leg keeps identity");
         assert!(
@@ -1452,7 +1943,12 @@ mod tests {
         decode_keys.sort();
         assert_eq!(
             decode_keys,
-            vec!["image_grid_thw", "second_per_grid_ts", "ts_sizes"]
+            vec![
+                "image_grid_thw",
+                "second_per_grid_ts",
+                "ts_sizes",
+                "video_second_per_grid"
+            ]
         );
         assert_eq!(decode_mm.batched_keys, vec!["image_grid_thw".to_string()]);
         assert_eq!(
@@ -1504,6 +2000,253 @@ mod tests {
             Some(7),
             "decode leg keeps per-item metadata"
         );
+    }
+
+    /// A full vLLM multimodal request: expanded token ids, pixels, grids,
+    /// an extra video batch, media refs and a relayed KV handoff.
+    fn vllm_pd_mm_request() -> ProtoGenerateRequest {
+        let grid = vllm::TensorData {
+            shape: vec![1, 3],
+            dtype: "int64".to_string(),
+            payload: Some(vllm::tensor_data::Payload::Inline(vec![0; 24])),
+        };
+        let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: "pd-lmo".to_string(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids: vec![1, 2, 151_655, 151_655, 3],
+                },
+            )),
+            mm_inputs: Some(vllm::MultimodalInputs {
+                pixel_values: Some(vllm::TensorData::default()),
+                model_specific_tensors: std::collections::HashMap::from([(
+                    "image_grid_thw".to_string(),
+                    grid,
+                )]),
+                im_token_id: Some(151_655),
+                mm_placeholders: vec![vllm::PlaceholderRange {
+                    offset: 2,
+                    length: 2,
+                }],
+                mm_hashes: vec!["img-hash".to_string()],
+                ..Default::default()
+            }),
+            extra_mm_inputs: vec![vllm::MultimodalInputs {
+                mm_hashes: vec!["vid-hash".to_string()],
+                modality: smg_grpc_client::common_proto::Modality::Video as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+        request.set_kv_transfer_params_json("{\"do_remote_prefill\":true}".to_string());
+        request
+            .set_vllm_media_refs(vllm::MediaRefs {
+                items: vec![vllm::MediaRef {
+                    modality: smg_grpc_client::common_proto::Modality::Image as i32,
+                    url: "https://a/1.png".to_string(),
+                }],
+            })
+            .expect("vLLM request accepts media refs");
+        request
+    }
+
+    #[test]
+    fn clone_without_mm_keeps_only_hashes_ids_and_kv_params() {
+        let mut request = vllm_pd_mm_request();
+        let clone = request.clone_without_mm();
+        let ProtoGenerateRequest::Vllm(original) = request else {
+            panic!("expected vLLM request");
+        };
+        let ProtoGenerateRequest::Vllm(decode) = clone else {
+            panic!("expected vLLM clone");
+        };
+
+        // The original (prefill leg) is untouched.
+        let original_mm = original
+            .mm_inputs
+            .as_ref()
+            .expect("prefill keeps mm_inputs");
+        assert!(original_mm.pixel_values.is_some());
+        assert!(original.media_refs.is_some());
+
+        // The expanded placeholder-token run survives: it names the sequence
+        // whose KV the decode worker pulls from prefill.
+        let Some(vllm::generate_request::Input::Tokenized(tokenized)) = &decode.input else {
+            panic!("decode leg stays tokenized");
+        };
+        assert_eq!(tokenized.input_ids, vec![1, 2, 151_655, 151_655, 3]);
+
+        // The KV handoff survives verbatim.
+        assert_eq!(
+            decode.kv_transfer_params_json.as_deref(),
+            Some("{\"do_remote_prefill\":true}")
+        );
+
+        // Media references never reach a language-model-only decode worker.
+        assert!(decode.media_refs.is_none());
+
+        // Each batch keeps exactly its content hashes (the servicer folds
+        // them into cache_salt) and modality; pixels, placeholders, grids and
+        // the placeholder token id are gone.
+        let decode_mm = decode.mm_inputs.expect("hash identity kept");
+        assert_eq!(decode_mm.mm_hashes, vec!["img-hash".to_string()]);
+        assert!(decode_mm.pixel_values.is_none());
+        assert!(decode_mm.model_specific_tensors.is_empty());
+        assert!(decode_mm.mm_placeholders.is_empty());
+        assert!(decode_mm.im_token_id.is_none());
+        assert!(decode_mm.batched_keys.is_empty());
+        assert!(decode_mm.flat_keys.is_empty());
+        assert_eq!(decode.extra_mm_inputs.len(), 1);
+        let extra = &decode.extra_mm_inputs[0];
+        assert_eq!(extra.mm_hashes, vec!["vid-hash".to_string()]);
+        assert_eq!(
+            extra.modality,
+            smg_grpc_client::common_proto::Modality::Video as i32
+        );
+    }
+
+    #[test]
+    fn clone_without_mm_drops_hashless_batches_whole() {
+        let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            mm_inputs: Some(vllm::MultimodalInputs {
+                pixel_values: Some(vllm::TensorData::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        let clone = request.clone_without_mm();
+        let ProtoGenerateRequest::Vllm(decode) = clone else {
+            panic!("expected vLLM clone");
+        };
+        assert!(
+            decode.mm_inputs.is_none(),
+            "a hash-less batch carries no identity worth keeping"
+        );
+    }
+
+    #[test]
+    fn has_vllm_mrope_grids_reads_every_batch() {
+        let plain = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            mm_inputs: Some(vllm::MultimodalInputs {
+                mm_hashes: vec!["h".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert!(!plain.has_vllm_mrope_grids());
+
+        // Grids hiding in a non-primary batch (mixed-modality request) count.
+        let mut mixed = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut mixed else {
+            panic!("expected vLLM request");
+        };
+        req.mm_inputs
+            .as_mut()
+            .unwrap()
+            .model_specific_tensors
+            .clear();
+        req.extra_mm_inputs[0]
+            .model_specific_tensors
+            .insert("video_grid_thw".to_string(), vllm::TensorData::default());
+        assert!(mixed.has_vllm_mrope_grids());
+
+        let text = ProtoGenerateRequest::Vllm(Box::default());
+        assert!(!text.has_vllm_mrope_grids());
+    }
+
+    #[test]
+    fn sequential_pd_decode_form_picks_the_leg_for_the_worker() {
+        let mm_request = vllm_pd_mm_request();
+
+        // Full-vision decode worker: today's forms, untouched.
+        assert_eq!(
+            sequential_pd_decode_form(&mm_request, false, true).expect("vision decode"),
+            SequentialPdDecodeForm::IdentityOnly
+        );
+        assert_eq!(
+            sequential_pd_decode_form(&mm_request, false, false).expect("vision decode n>1"),
+            SequentialPdDecodeForm::Full
+        );
+
+        // Language-model-only decode worker, no grids (MiniMax-style): the
+        // fully stripped leg. A text request takes the same leg harmlessly.
+        let mut stripable = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut stripable else {
+            panic!("expected vLLM request");
+        };
+        req.media_refs = None;
+        req.mm_inputs
+            .as_mut()
+            .unwrap()
+            .model_specific_tensors
+            .clear();
+        assert_eq!(
+            sequential_pd_decode_form(&stripable, true, true).expect("stripped leg"),
+            SequentialPdDecodeForm::TextPlusHashes
+        );
+        let text = ProtoGenerateRequest::Vllm(Box::default());
+        assert_eq!(
+            sequential_pd_decode_form(&text, true, true).expect("text request"),
+            SequentialPdDecodeForm::TextPlusHashes
+        );
+        assert_eq!(
+            sequential_pd_decode_form(&text, true, false).expect("text n>1"),
+            SequentialPdDecodeForm::TextPlusHashes
+        );
+    }
+
+    #[test]
+    fn has_kv_transfer_params_reads_both_wire_forms() {
+        let mut json = ProtoGenerateRequest::Vllm(Box::default());
+        assert!(!json.has_kv_transfer_params());
+        json.set_kv_transfer_params_json("{\"do_remote_prefill\":true}".to_string());
+        assert!(json.has_kv_transfer_params());
+
+        let mut typed = ProtoGenerateRequest::Vllm(Box::default());
+        typed.set_kv_transfer_params("10.0.0.1".to_string(), 8998);
+        assert!(typed.has_kv_transfer_params());
+
+        // Non-vLLM backends carry no connector handoff field.
+        assert!(!tokenspeed_request(1, None).has_kv_transfer_params());
+    }
+
+    #[tokio::test]
+    async fn sequential_pd_decode_form_rejects_incompatible_pairings() {
+        // M-RoPE grids + language-model-only decode: cannot strip (positions
+        // would be wrong), cannot send (encoder-cache budget 0).
+        let gridded = vllm_pd_mm_request();
+        let response = sequential_pd_decode_form(&gridded, true, true)
+            .expect_err("mRoPE grids need a vision-capable decode worker");
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+
+        // Media references + language-model-only decode: the leg would have
+        // to expand the anchors itself.
+        let mut refs_only = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut refs_only else {
+            panic!("expected vLLM request");
+        };
+        req.mm_inputs = None;
+        req.extra_mm_inputs.clear();
+        let response = sequential_pd_decode_form(&refs_only, true, true)
+            .expect_err("media refs need a processing decode worker");
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+
+        // n>1 + mm + language-model-only decode: no KV handoff, no local
+        // recompute either.
+        let mut fanout = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut fanout else {
+            panic!("expected vLLM request");
+        };
+        req.media_refs = None;
+        req.mm_inputs
+            .as_mut()
+            .unwrap()
+            .model_specific_tensors
+            .clear();
+        let response = sequential_pd_decode_form(&fanout, true, false)
+            .expect_err("n>1 cannot recompute on a pixel-less decode worker");
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -1574,22 +2317,22 @@ mod tests {
     fn kv_transfer_params_json_complete_accessor_filters_empty() {
         use crate::routers::grpc::proto_wrapper::ProtoGenerateComplete;
 
-        let complete = ProtoGenerateComplete::Vllm(vllm::GenerateComplete {
+        let complete = ProtoGenerateComplete::Vllm(Box::new(vllm::GenerateComplete {
             kv_transfer_params_json: Some(r#"{"do_remote_prefill":true}"#.to_string()),
             ..Default::default()
-        });
+        }));
         assert_eq!(
             complete.kv_transfer_params_json(),
             Some(r#"{"do_remote_prefill":true}"#)
         );
 
-        let empty = ProtoGenerateComplete::Vllm(vllm::GenerateComplete {
+        let empty = ProtoGenerateComplete::Vllm(Box::new(vllm::GenerateComplete {
             kv_transfer_params_json: Some(String::new()),
             ..Default::default()
-        });
+        }));
         assert_eq!(empty.kv_transfer_params_json(), None);
 
-        let unset = ProtoGenerateComplete::Vllm(vllm::GenerateComplete::default());
+        let unset = ProtoGenerateComplete::Vllm(Box::default());
         assert_eq!(unset.kv_transfer_params_json(), None);
     }
 }

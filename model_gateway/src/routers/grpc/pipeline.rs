@@ -97,6 +97,7 @@ pub(crate) struct PipelineDeps {
     reasoning_parser_factory: ReasoningParserFactory,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
+    response_templates: Option<Arc<utils::ResponseTemplateParsers>>,
     /// `None` when tenant rate limiting is disabled; read only by the
     /// endpoints that insert `RateLimitReserveStage` (chat/messages/completion/harmony).
     rate_limit_manager: Option<Arc<RateLimitManager>>,
@@ -105,6 +106,7 @@ pub(crate) struct PipelineDeps {
 impl PipelineDeps {
     /// Full deps for the chat/messages/harmony endpoints, which consume the
     /// configured parser factories/overrides.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
@@ -112,6 +114,7 @@ impl PipelineDeps {
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
+        response_templates: Option<Arc<utils::ResponseTemplateParsers>>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
     ) -> Self {
         Self {
@@ -121,6 +124,7 @@ impl PipelineDeps {
             reasoning_parser_factory,
             configured_tool_parser,
             configured_reasoning_parser,
+            response_templates,
             rate_limit_manager,
         }
     }
@@ -139,6 +143,7 @@ impl PipelineDeps {
             reasoning_parser_factory: ReasoningParserFactory::default(),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            response_templates: None,
             rate_limit_manager,
         }
     }
@@ -156,6 +161,7 @@ impl PipelineDeps {
             self.worker_registry.clone(),
             self.configured_tool_parser.clone(),
             self.configured_reasoning_parser.clone(),
+            self.response_templates.clone(),
         );
         let processor = processor::ResponseProcessor::new(
             self.tool_parser_factory.clone(),
@@ -203,6 +209,7 @@ impl PipelineDeps {
             reasoning_parser_factory: ReasoningParserFactory::default(),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            response_templates: None,
             rate_limit_manager: None,
         }
     }
@@ -425,6 +432,24 @@ impl RequestPipeline {
                 "Worker selection not completed",
             )
         })?;
+        // The window is a property of the selected worker's model card, so
+        // this has to follow selection; it precedes client acquisition so a
+        // request no engine could accept never reaches one (#2380).
+        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
+            error!(function = "run_ingress", "Preparation stage not completed");
+            error::internal_error(
+                "preparation_stage_not_completed",
+                "Preparation stage not completed",
+            )
+        })?;
+        step!(
+            "ContextLength",
+            enforce_context_length(prep, workers, &ctx.input.model_id)
+        )?;
+        step!(
+            "OutputBudget",
+            enforce_output_budget(&ctx.input.request_type, workers, &ctx.input.model_id)
+        )?;
         ctx.state.clients = Some(step!(
             "ClientAcquisition",
             acquire_clients(workers, &ctx.input.model_id).await
@@ -495,7 +520,7 @@ impl RequestPipeline {
             dctx.workers.as_ref(),
         ));
 
-        execute_plan(dctx, attempt_plan).await?;
+        execute_plan(dctx, attempt_plan, last_attempt).await?;
         self.stages
             .response_processing
             .process(dctx, spec.clone())
@@ -769,7 +794,10 @@ impl RequestPipeline {
                     let usage = response.usage.as_ref();
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        usage.map_or(0, |u| u.prompt_tokens),
+                        // The engine's count: the usage shown excludes the unbilled stub.
+                        usage.map_or(0, |u| {
+                            u.prompt_tokens + dctx.response.unbilled_prompt_tokens
+                        }),
                         usage.map_or(0, |u| u.completion_tokens),
                     )
                     .await;
@@ -1407,6 +1435,7 @@ mod alias_pipeline_tests {
 #[cfg(test)]
 mod request_release_tests {
     use std::{
+        path::{Path, PathBuf},
         pin::Pin,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1415,8 +1444,11 @@ mod request_release_tests {
         time::Duration,
     };
 
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use futures::Stream;
-    use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
+    use llm_tokenizer::{
+        traits::Tokenizer, HuggingFaceTokenizer, MockTokenizer, TokenizerRegistry,
+    };
     use openai_protocol::{
         completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
     };
@@ -1430,11 +1462,16 @@ mod request_release_tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
+        routers::grpc::multimodal::{
+            MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
+        },
         worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
     };
 
     const MODEL: &str = "request-release-test-model";
 
+    /// The `(offset, length)` placeholder ranges of one generate call.
+    type PlaceholderRanges = Vec<(u32, u32)>;
     type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
     type KvEventStream = Pin<Box<dyn Stream<Item = Result<common::KvEventBatch, Status>> + Send>>;
     type TokenizerStream =
@@ -1460,6 +1497,7 @@ mod request_release_tests {
         answer_after: Option<Duration>,
         calls: Arc<AtomicUsize>,
         seen_input_ids: Arc<Mutex<Vec<Vec<u32>>>>,
+        seen_mm_placeholders: Arc<Mutex<Vec<PlaceholderRanges>>>,
         seen_request_ids: Arc<Mutex<Vec<String>>>,
         aborted_request_ids: Arc<Mutex<Vec<String>>>,
     }
@@ -1520,6 +1558,23 @@ mod request_release_tests {
             request: TonicRequest<ts::GenerateRequest>,
         ) -> Result<TonicResponse<Self::GenerateStream>, Status> {
             let request = request.into_inner();
+            self.seen_mm_placeholders
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(
+                    request
+                        .mm_inputs
+                        .as_ref()
+                        .map(|mm| {
+                            mm.items
+                                .iter()
+                                .flat_map(|item| {
+                                    item.placeholders.iter().map(|p| (p.offset, p.length))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
             self.seen_input_ids
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -2059,6 +2114,315 @@ mod request_release_tests {
             dispatched.as_slice(),
             "the abort must name the decode leg's own request id"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // DeepSeek-V4.1 parity through the pipeline with the real checkpoint
+    // tokenizer. Needs `DEEPSEEK_V41_MODEL_DIR` (or the tokenizer crate's
+    // download cache); skips otherwise, like the tokenizer crate's parity
+    // test.
+    // ------------------------------------------------------------------
+
+    const V41_RENDER_FIXTURES: &str = include_str!(
+        "../../../../crates/tokenizer/tests/fixtures/deepseek_v41/render_fixtures.json"
+    );
+    const V41_ID_FIXTURES: &str = include_str!(
+        "../../../../crates/tokenizer/tests/fixtures/deepseek_v41/render_ids_fixtures.json"
+    );
+    const V41_CORN_PNG: &[u8] =
+        include_bytes!("../../../../crates/multimodal/tests/fixtures/images/deepseek_v41_corn.png");
+    /// `<｜deepseek_image｜>` in the checkpoint's `config.json`.
+    const V41_IMAGE_TOKEN_ID: u32 = 129264;
+    /// The reference span for `deepseek_v41_corn.png` (450x308), recorded in
+    /// the multimodal crate's goldens.
+    const V41_CORN_TOKENS: usize = 189;
+
+    fn deepseek_v41_model_dir() -> Option<PathBuf> {
+        let dir = std::env::var_os("DEEPSEEK_V41_MODEL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../crates/tokenizer/.tokenizer_cache/deepseek_v41")
+            });
+        (dir.join("tokenizer.json").is_file() && dir.join("config.json").is_file()).then_some(dir)
+    }
+
+    #[expect(
+        clippy::print_stderr,
+        reason = "test diagnostic: says why the parity test did not run"
+    )]
+    fn skip_no_tokenizer() {
+        eprintln!("skipping: no DeepSeek-V4.1 tokenizer (set DEEPSEEK_V41_MODEL_DIR)");
+    }
+
+    /// The recorded request (`messages`, kwargs) and reference ids of one
+    /// tokenizer-crate fixture case.
+    fn v41_fixture(name: &str) -> (serde_json::Value, Vec<u32>) {
+        let render: serde_json::Value =
+            serde_json::from_str(V41_RENDER_FIXTURES).expect("render fixtures");
+        let ids: serde_json::Value = serde_json::from_str(V41_ID_FIXTURES).expect("id fixtures");
+        let find = |doc: &serde_json::Value| {
+            doc["cases"]
+                .as_array()
+                .expect("cases")
+                .iter()
+                .find(|case| case["name"] == name)
+                .unwrap_or_else(|| panic!("fixture case {name}"))
+                .clone()
+        };
+        let case = find(&render);
+        let ids = find(&ids)["ids"]
+            .as_array()
+            .expect("ids")
+            .iter()
+            .map(|id| id.as_u64().expect("token id") as u32)
+            .collect();
+        (case, ids)
+    }
+
+    async fn v41_components(
+        dir: &Path,
+        worker_registry: Arc<WorkerRegistry>,
+        with_multimodal: bool,
+    ) -> Arc<SharedComponents> {
+        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+        let tokenizer_path = dir.join("tokenizer.json");
+        let tokenizer = Arc::new(
+            HuggingFaceTokenizer::from_file(tokenizer_path.to_str().expect("utf-8 tokenizer path"))
+                .expect("load the DeepSeek-V4.1 tokenizer"),
+        ) as Arc<dyn Tokenizer>;
+        // The tokenizer's source is the checkpoint directory: the multimodal
+        // config registry reads `config.json` (image_token_id) from it.
+        let source = dir.to_string_lossy().into_owned();
+        tokenizer_registry
+            .load(
+                "deepseek-v41",
+                MODEL,
+                &source,
+                || async move { Ok(tokenizer) },
+            )
+            .await
+            .expect("register the DeepSeek-V4.1 tokenizer");
+        let multimodal = with_multimodal.then(|| {
+            Arc::new(
+                MultimodalComponents::new(
+                    Arc::new(MultimodalConfigRegistry::new()),
+                    None,
+                    None,
+                    &MultimodalSettings::default(),
+                )
+                .expect("multimodal components"),
+            )
+        });
+        Arc::new(SharedComponents {
+            tokenizer_registry,
+            worker_registry,
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            parser_resolver: utils::ParserResolver::disabled(),
+            multimodal,
+        })
+    }
+
+    /// Status, body, and the input ids and placeholders of every attempt a
+    /// chat request produced.
+    type ChatRun = (
+        http::StatusCode,
+        bytes::Bytes,
+        Vec<Vec<u32>>,
+        Vec<PlaceholderRanges>,
+    );
+
+    /// Runs one chat request against a recording TokenSpeed stub.
+    async fn v41_run_chat(
+        dir: &Path,
+        request: serde_json::Value,
+        with_multimodal: bool,
+    ) -> ChatRun {
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let seen_mm = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            seen_input_ids: Arc::clone(&seen_ids),
+            seen_mm_placeholders: Arc::clone(&seen_mm),
+            ..Default::default()
+        })
+        .await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, port, WorkerType::Regular);
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+        );
+        let pipeline =
+            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        let components = v41_components(dir, worker_registry, with_multimodal).await;
+        let request: Arc<ChatCompletionRequest> =
+            Arc::new(serde_json::from_value(request).expect("chat request"));
+        let response = pipeline
+            .execute_chat(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let ids = seen_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let mm = seen_mm
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        (status, body, ids, mm)
+    }
+
+    /// The prompt ids the worker receives equal the reference encoder's ids
+    /// for a recorded multi-turn chat-mode case, and a `continue_final_message`
+    /// request keeps its trailing assistant message and renders it the
+    /// reference way (no EOS, no generation header) instead of as a prefix.
+    #[tokio::test]
+    async fn deepseek_v41_prompt_ids_match_the_reference_through_the_pipeline() {
+        let Some(dir) = deepseek_v41_model_dir() else {
+            skip_no_tokenizer();
+            return;
+        };
+
+        let (case, expected) = v41_fixture("hf_2");
+        let (status, body, ids, _) = v41_run_chat(
+            &dir,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": case["messages"],
+                "chat_template_kwargs": {"thinking": false, "drop_thinking": true},
+                "max_tokens": 1,
+            }),
+            false,
+        )
+        .await;
+        assert_eq!(
+            status,
+            http::StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            ids,
+            vec![expected],
+            "hf_2: prompt ids differ from the reference"
+        );
+
+        let (case, expected) = v41_fixture("continue_final_message");
+        let (status, body, ids, _) = v41_run_chat(
+            &dir,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": case["messages"],
+                "continue_final_message": true,
+                "chat_template_kwargs": {"thinking": true, "drop_thinking": true},
+                "max_tokens": 1,
+            }),
+            false,
+        )
+        .await;
+        assert_eq!(
+            status,
+            http::StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            ids,
+            vec![expected],
+            "continue_final_message: prompt ids differ from the reference's no-EOS rendering"
+        );
+    }
+
+    /// A renderer validation error (an effort level the reference rejects) is
+    /// the client's mistake, so it surfaces as 400, not 500.
+    #[tokio::test]
+    async fn deepseek_v41_invalid_effort_is_a_bad_request() {
+        let Some(dir) = deepseek_v41_model_dir() else {
+            skip_no_tokenizer();
+            return;
+        };
+        let (status, body, ids, _) = v41_run_chat(
+            &dir,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "reasoning_effort": "medium",
+                "max_tokens": 1,
+            }),
+            false,
+        )
+        .await;
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Invalid reasoning effort"), "{body}");
+        assert!(ids.is_empty(), "nothing must reach the worker");
+    }
+
+    /// One image expands to exactly the reference span: `<｜deepseek_image｜>`
+    /// is inlined at the part's position by the renderer and replaced by
+    /// `image_token_id` repeated once per span position (189 for the corn
+    /// example), and the worker is told that span as the placeholder range.
+    #[tokio::test]
+    async fn deepseek_v41_image_expands_to_the_reference_span() {
+        let Some(dir) = deepseek_v41_model_dir() else {
+            skip_no_tokenizer();
+            return;
+        };
+        let data_url = format!("data:image/png;base64,{}", BASE64.encode(V41_CORN_PNG));
+        let (status, body, ids, mm) = v41_run_chat(
+            &dir,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this picture?"},
+                        {"type": "image_url", "image_url": {"url": data_url}}
+                    ]
+                }],
+                "chat_template_kwargs": {"thinking": false},
+                "max_tokens": 1,
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(
+            status,
+            http::StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(ids.len(), 1);
+        let prompt = &ids[0];
+        let count = prompt
+            .iter()
+            .filter(|&&id| id == V41_IMAGE_TOKEN_ID)
+            .count();
+        assert_eq!(count, V41_CORN_TOKENS, "image span length");
+        let first = prompt
+            .iter()
+            .position(|&id| id == V41_IMAGE_TOKEN_ID)
+            .expect("the image span is present");
+        assert!(
+            prompt[first..first + V41_CORN_TOKENS]
+                .iter()
+                .all(|&id| id == V41_IMAGE_TOKEN_ID),
+            "the image span is contiguous"
+        );
+        assert_eq!(mm, vec![vec![(first as u32, V41_CORN_TOKENS as u32)]]);
     }
 }
 

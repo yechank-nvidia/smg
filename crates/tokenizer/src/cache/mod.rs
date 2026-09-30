@@ -14,12 +14,14 @@
 //! let encoding = cached.encode("Hello world")?;
 //! ```
 
+mod activity;
 mod fingerprint;
 mod l0;
 mod l1;
 
 use std::sync::Arc;
 
+pub use activity::{cache_activity_stats, CacheActivityStats};
 use anyhow::Result;
 pub use fingerprint::TokenizerFingerprint;
 pub use l0::{CacheStats, L0Cache};
@@ -280,6 +282,10 @@ impl Tokenizer for CachedTokenizer {
         self
     }
 
+    fn response_template(&self) -> Option<&serde_json::Value> {
+        self.inner.response_template()
+    }
+
     fn apply_chat_template(
         &self,
         messages: &[serde_json::Value],
@@ -320,8 +326,16 @@ impl Tokenizer for CachedTokenizer {
         self.inner.native_reasoning_effort_values()
     }
 
+    fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
+        self.inner.native_reasoning_effort_off_values()
+    }
+
     fn think_in_prefill(&self) -> bool {
         self.inner.think_in_prefill()
+    }
+
+    fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
+        self.inner.renderer_capabilities()
     }
 
     fn eos_token_ids(&self) -> &[TokenIdType] {
@@ -702,7 +716,9 @@ mod tests {
             traits::{PromptEncoding, Tokenizer as _},
         };
 
-        let inner = MockTokenizer::new().with_deferred_chat_ids(vec![7, 8, 9]);
+        let inner = MockTokenizer::new()
+            .with_deferred_chat_ids(vec![7, 8, 9])
+            .with_unbilled_prompt_tokens(3);
         let cached = CachedTokenizer::new(
             Arc::new(inner),
             CacheConfig {
@@ -724,6 +740,7 @@ mod tests {
             "{}",
             rendered.text
         );
+        assert_eq!(rendered.unbilled_prompt_tokens, 3);
         let PromptEncoding::Deferred(job) = rendered.encoding else {
             panic!("the wrapper must hand the inner tokenizer's deferred encode through");
         };
@@ -749,5 +766,14 @@ mod tests {
         let _ = flat.encode(&rendered.text, false).unwrap();
         let _ = flat.encode(&rendered.text, false).unwrap();
         assert_eq!(flat.cache_stats().map(|s| s.hits), Some(1));
+    }
+
+    #[test]
+    fn cached_tokenizer_retains_response_template() {
+        let expected = serde_json::json!({"sentinel": "retained-through-cache"});
+        let inner = MockTokenizer::new().with_response_template(expected.clone());
+        let cached = CachedTokenizer::new(Arc::new(inner), CacheConfig::default());
+
+        assert_eq!(cached.response_template(), Some(&expected));
     }
 }

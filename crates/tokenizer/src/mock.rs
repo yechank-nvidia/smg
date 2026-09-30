@@ -5,10 +5,12 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Result;
 
 use crate::{
-    chat_template::ChatTemplateParams,
+    chat_template::{
+        ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+    },
     traits::{
-        ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, PromptEncoding, SpecialTokens,
-        Tokenizer as TokenizerTrait,
+        ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, PromptEncoding,
+        RendererCapabilities, SpecialTokens, Tokenizer as TokenizerTrait,
     },
 };
 
@@ -22,6 +24,22 @@ pub struct MockTokenizer {
     deferred_chat_ids: Option<Vec<u32>>,
     /// Runs inside the deferred job, on whatever thread the caller runs it.
     deferred_chat_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Reported as the rendering's `unbilled_prompt_tokens`.
+    unbilled_prompt_tokens: u32,
+    /// The renderer-shaped trait hooks, so a test can stand in for a native
+    /// renderer (thinking toggle, effort names, capabilities) without a
+    /// checkpoint.
+    thinking_toggle: ThinkingToggle,
+    thinking_key_name: Option<ThinkingKeyName>,
+    native_reasoning_effort_values: &'static [&'static str],
+    native_reasoning_effort_off_values: &'static [&'static str],
+    renderer_capabilities: RendererCapabilities,
+    content_format: ChatTemplateContentFormat,
+    /// When set, `apply_chat_template` renders the message list and the
+    /// generation-prompt flag as JSON, so a test can assert exactly what
+    /// reached the template.
+    json_chat_template: bool,
+    response_template: Option<serde_json::Value>,
 }
 
 impl Default for MockTokenizer {
@@ -75,6 +93,15 @@ impl MockTokenizer {
             special_tokens,
             deferred_chat_ids: None,
             deferred_chat_probe: None,
+            unbilled_prompt_tokens: 0,
+            thinking_toggle: ThinkingToggle::None,
+            thinking_key_name: None,
+            native_reasoning_effort_values: &[],
+            native_reasoning_effort_off_values: &[],
+            renderer_capabilities: RendererCapabilities::default(),
+            content_format: ChatTemplateContentFormat::default(),
+            json_chat_template: false,
+            response_template: None,
         }
     }
 
@@ -90,6 +117,65 @@ impl MockTokenizer {
     /// caller ran it.
     pub fn with_deferred_chat_probe(mut self, probe: impl Fn() + Send + Sync + 'static) -> Self {
         self.deferred_chat_probe = Some(Arc::new(probe));
+        self
+    }
+
+    /// Report `n` unbilled prompt tokens on every rendering.
+    pub fn with_unbilled_prompt_tokens(mut self, n: u32) -> Self {
+        self.unbilled_prompt_tokens = n;
+        self
+    }
+
+    /// Report `toggle` from `thinking_toggle()`.
+    pub fn with_thinking_toggle(mut self, toggle: ThinkingToggle) -> Self {
+        self.thinking_toggle = toggle;
+        self
+    }
+
+    /// Report `name` from `thinking_key_name()`.
+    pub fn with_thinking_key_name(mut self, name: ThinkingKeyName) -> Self {
+        self.thinking_key_name = Some(name);
+        self
+    }
+
+    /// Report `values` from `native_reasoning_effort_values()`.
+    pub fn with_native_reasoning_effort_values(mut self, values: &'static [&'static str]) -> Self {
+        self.native_reasoning_effort_values = values;
+        self
+    }
+
+    /// Report `values` from `native_reasoning_effort_off_values()`.
+    pub fn with_native_reasoning_effort_off_values(
+        mut self,
+        values: &'static [&'static str],
+    ) -> Self {
+        self.native_reasoning_effort_off_values = values;
+        self
+    }
+
+    /// Declare `capabilities` from `renderer_capabilities()`.
+    pub fn with_renderer_capabilities(mut self, capabilities: RendererCapabilities) -> Self {
+        self.renderer_capabilities = capabilities;
+        self
+    }
+
+    /// Report `format` from `chat_template_content_format()`.
+    pub fn with_content_format(mut self, format: ChatTemplateContentFormat) -> Self {
+        self.content_format = format;
+        self
+    }
+
+    /// Render `{"messages": [...], "add_generation_prompt": bool}` instead of
+    /// the `role: content` lines, so a test can assert on the exact message
+    /// list the template received.
+    pub fn with_json_chat_template(mut self) -> Self {
+        self.json_chat_template = true;
+        self
+    }
+
+    /// Report `template` from `response_template()`.
+    pub fn with_response_template(mut self, template: serde_json::Value) -> Self {
+        self.response_template = Some(template);
         self
     }
 }
@@ -155,6 +241,30 @@ impl TokenizerTrait for MockTokenizer {
         &[999]
     }
 
+    fn thinking_toggle(&self) -> ThinkingToggle {
+        self.thinking_toggle
+    }
+
+    fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
+        self.thinking_key_name
+    }
+
+    fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
+        self.native_reasoning_effort_values
+    }
+
+    fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
+        self.native_reasoning_effort_off_values
+    }
+
+    fn renderer_capabilities(&self) -> RendererCapabilities {
+        self.renderer_capabilities
+    }
+
+    fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
+        self.content_format
+    }
+
     /// One `role: content` line per message, plus an `assistant:` tail when a
     /// generation prompt is requested.
     fn apply_chat_template(
@@ -162,6 +272,13 @@ impl TokenizerTrait for MockTokenizer {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
+        if self.json_chat_template {
+            return Ok(serde_json::json!({
+                "messages": messages,
+                "add_generation_prompt": params.add_generation_prompt,
+            })
+            .to_string());
+        }
         let mut text = String::new();
         for message in messages {
             let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
@@ -203,10 +320,18 @@ impl TokenizerTrait for MockTokenizer {
             }
             None => PromptEncoding::FromText,
         };
-        Ok(ChatTemplateOutput { text, encoding })
+        Ok(ChatTemplateOutput {
+            text,
+            encoding,
+            unbilled_prompt_tokens: self.unbilled_prompt_tokens,
+        })
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn response_template(&self) -> Option<&serde_json::Value> {
+        self.response_template.as_ref()
     }
 }

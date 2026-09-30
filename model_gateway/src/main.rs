@@ -8,7 +8,7 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-use openai_protocol::worker::TransportMode;
+use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
@@ -19,6 +19,7 @@ use smg::{
         RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
         TokenizerCacheConfig, TraceConfig,
     },
+    mesh_discovery::MeshDiscoveryConfig,
     observability::{
         metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
         otel_trace::{is_otel_enabled, shutdown_otel},
@@ -163,6 +164,12 @@ enum Commands {
 fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
     TransportMode::parse(value)
         .ok_or_else(|| format!("invalid value '{value}'; expected inline, shm, auto, or rdma"))
+}
+
+/// Parse the `--mm-processing` value into an `MmProcessingMode`.
+fn parse_mm_processing(value: &str) -> Result<MmProcessingMode, String> {
+    MmProcessingMode::parse(value)
+        .ok_or_else(|| format!("invalid value '{value}'; expected auto, router, or worker"))
 }
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
@@ -599,10 +606,53 @@ struct CliArgs {
     #[arg(long, help_heading = "Multimodal")]
     multimodal_shm_min_bytes: Option<usize>,
 
+    /// Most bytes of preprocessed media the gateway holds in flight for engines
+    /// at once; a request that fits waits briefly, then gets 429, and one
+    /// larger than the whole budget gets 413 straight away. A waiting request
+    /// still holds its media, so size memory for about twice this value.
+    /// Unset: unbounded. Zero is refused rather than read as unset.
+    #[arg(long, help_heading = "Multimodal")]
+    multimodal_max_inflight_bytes: Option<usize>,
+
     /// Per-request image-count limit applied to every model, replacing each
     /// spec's built-in limit (e.g. to match the engine's `--limit-mm-per-prompt`).
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Multimodal")]
     mm_per_request_image_limit: Option<u64>,
+
+    /// Where media for vLLM gRPC workers is fetched and preprocessed:
+    /// `auto` (worker when the model spec and the worker both allow it,
+    /// else router), `router` (always the gateway), `worker` (always the
+    /// engine; models without worker expansion are rejected). Falls back to
+    /// `SMG_MM_PROCESSING`, then `auto`.
+    #[arg(long, value_parser = parse_mm_processing, help_heading = "Multimodal")]
+    mm_processing: Option<MmProcessingMode>,
+
+    /// Pixel cache budget in MiB for router-side preprocessed media; 0 keeps
+    /// the cache off. Falls back to `SMG_MM_PIXEL_CACHE_MB`.
+    #[arg(long, help_heading = "Multimodal")]
+    mm_pixel_cache_mb: Option<usize>,
+
+    /// Serve cached pixels over RDMA instead of inline bytes (the legacy
+    /// switch; `--multimodal-tensor-transport rdma` is the first-class one).
+    /// Falls back to `SMG_MM_PIXEL_RDMA`.
+    #[arg(long, action = ArgAction::SetTrue, help_heading = "Multimodal")]
+    mm_pixel_rdma: bool,
+
+    /// Listener IP for the RDMA pixel lane's metadata exchange; without one
+    /// the lane stays on the inline path. Falls back to `SMG_RDMA_LISTEN_IP`.
+    #[arg(long, help_heading = "Multimodal")]
+    rdma_listen_ip: Option<String>,
+
+    /// Seconds a leased RDMA pixel slot lives without a free notification;
+    /// must exceed the worker's hold or it is ignored for the derived TTL.
+    /// Falls back to `SMG_RDMA_SLOT_TTL_S`.
+    #[arg(long, help_heading = "Multimodal")]
+    rdma_slot_ttl_s: Option<u64>,
+
+    /// Emit per-request multimodal timing at INFO. Falls back to
+    /// `SMG_LOG_MM_TIMING`.
+    #[arg(long, action = ArgAction::SetTrue, help_heading = "Multimodal")]
+    log_mm_timing: bool,
 
     // ==================== Service Discovery (Kubernetes) ====================
     /// Enable Kubernetes service discovery
@@ -1402,6 +1452,21 @@ impl CliArgs {
             })
             .transpose()?;
 
+        // Port 0 parses fine as a socket address, but it is meaningless as an
+        // advertised one: peers gossip this port and cannot dial an ephemeral
+        // bind. It would also reach router discovery as the fallback mesh port
+        // for Pods whose annotation is missing or invalid, publishing `IP:0`
+        // peers into the cluster state.
+        if self.mesh_port == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "mesh_port".to_string(),
+                value: self.mesh_port.to_string(),
+                reason: "mesh port cannot be 0; peers dial the advertised port, \
+                         so it must be a fixed, routable one"
+                    .to_string(),
+            });
+        }
+
         let bind_addr = Self::parse_mesh_socket_addr(&self.mesh_host, self.mesh_port, "mesh_host")?;
         let (advertise_host, advertise_field) =
             if let Some(host) = self.mesh_advertise_host.as_deref() {
@@ -1864,7 +1929,14 @@ impl CliArgs {
             .engine_metrics(self.engine_metrics)
             .multimodal_tensor_transport(self.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
+            .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
             .mm_per_request_image_limit(self.mm_per_request_image_limit.map(|v| v as usize))
+            .mm_processing(self.mm_processing)
+            .mm_pixel_cache_mb(self.mm_pixel_cache_mb)
+            .mm_pixel_rdma(self.mm_pixel_rdma)
+            .rdma_listen_ip(self.rdma_listen_ip.clone())
+            .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
+            .log_mm_timing(self.log_mm_timing)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -1967,27 +2039,17 @@ impl CliArgs {
 
     fn to_server_config(&self, router_config: RouterConfig) -> ConfigResult<ServerConfig> {
         let service_discovery_config = if self.service_discovery {
-            // Get router discovery config from router_config.discovery if available
-            let (
-                router_selector,
-                router_mesh_port_annotation,
-                kv_connector_annotation,
-                kv_engine_id_annotation,
-            ) = router_config
+            let (kv_connector_annotation, kv_engine_id_annotation) = router_config
                 .discovery
                 .as_ref()
                 .map(|d| {
                     (
-                        d.router_selector.clone(),
-                        d.router_mesh_port_annotation.clone(),
                         d.kv_connector_annotation.clone(),
                         d.kv_engine_id_annotation.clone(),
                     )
                 })
                 .unwrap_or_else(|| {
                     (
-                        HashMap::new(),
-                        "sglang.ai/mesh-port".to_string(),
                         self.kv_connector_annotation.clone(),
                         self.kv_engine_id_annotation.clone(),
                     )
@@ -2025,13 +2087,25 @@ impl CliArgs {
                 worker_ports_annotation: "smg.ai/worker-ports".to_string(),
                 kv_connector_annotation,
                 kv_engine_id_annotation,
-                router_selector,
-                router_mesh_port_annotation,
                 model_id_source,
             })
         } else {
             None
         };
+
+        // Mesh-router discovery now has its own task and lifetime, but its
+        // configuration still arrives inside `discovery`, so it stays reachable
+        // only under `--service-discovery`. Moving it onto its own config
+        // surface lands with the tagged provider configuration.
+        let mesh_discovery_config = router_config
+            .discovery
+            .as_ref()
+            .map(|d| MeshDiscoveryConfig {
+                namespace: d.namespace.clone(),
+                router_selector: d.router_selector.clone(),
+                router_mesh_port_annotation: d.router_mesh_port_annotation.clone(),
+            })
+            .filter(MeshDiscoveryConfig::is_enabled);
 
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port,
@@ -2067,6 +2141,7 @@ impl CliArgs {
             log_level: Some(self.log_level.clone()),
             log_json: self.log_json,
             service_discovery_config,
+            mesh_discovery_config,
             prometheus_config,
             request_timeout_secs: self.request_timeout_secs,
             request_id_headers: if self.request_id_headers.is_empty() {
@@ -2447,6 +2522,89 @@ mod tests {
         assert_eq!(format!("{canonical:?}"), format!("{aliased:?}"));
     }
 
+    /// Mesh-router discovery has its own task and lifetime, but is still
+    /// configured through `discovery`, which only `--service-discovery`
+    /// populates. `--router-selector` alone therefore still does nothing; it
+    /// gains its own config surface with the tagged provider configuration.
+    #[test]
+    fn router_selector_alone_does_not_yet_configure_mesh_discovery() {
+        let cli = cli_args_from(&["--router-selector", "role=router"]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(router.discovery.is_none());
+
+        let server = cli.to_server_config(router).unwrap();
+        assert!(server.service_discovery_config.is_none());
+        assert!(server.mesh_discovery_config.is_none());
+    }
+
+    #[test]
+    fn mesh_discovery_is_absent_without_a_router_selector() {
+        let cli = cli_args_from(&["--service-discovery", "--selector", "app=worker"]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let server = cli.to_server_config(router).unwrap();
+        assert!(server.service_discovery_config.is_some());
+        assert!(server.mesh_discovery_config.is_none());
+    }
+
+    /// The router selector reaches the new independent mesh task unchanged.
+    #[test]
+    fn service_discovery_router_selector_reaches_mesh_discovery() {
+        let cli = cli_args_from(&[
+            "--service-discovery",
+            "--selector",
+            "app=worker",
+            "--router-selector",
+            "role=router",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let server = cli.to_server_config(router).unwrap();
+        let mesh = server.mesh_discovery_config.expect("mesh discovery config");
+        assert_eq!(
+            mesh.router_selector.get("role").map(String::as_str),
+            Some("router")
+        );
+    }
+
+    /// Port 0 parses as a socket address, so nothing downstream rejects it:
+    /// it would be advertised to peers and used as the fallback mesh port for
+    /// router Pods with no usable annotation, publishing `IP:0` peers.
+    #[test]
+    fn mesh_port_zero_is_rejected() {
+        let cli = cli_args_from(&[
+            "--enable-mesh",
+            "--mesh-advertise-host",
+            "10.0.0.1",
+            "--mesh-port",
+            "0",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        // `ServerConfig` is not `Debug`, so unwrap the error by hand.
+        let Err(err) = cli.to_server_config(router) else {
+            panic!("mesh port 0 must be rejected");
+        };
+        assert!(
+            format!("{err}").contains("mesh port cannot be 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The same configuration with a real port still builds, so the guard is
+    /// not rejecting every meshed setup.
+    #[test]
+    fn mesh_port_nonzero_is_accepted() {
+        let cli = cli_args_from(&[
+            "--enable-mesh",
+            "--mesh-advertise-host",
+            "10.0.0.1",
+            "--mesh-port",
+            "39527",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let server = cli.to_server_config(router).unwrap();
+        let mesh = server.mesh_server_config.expect("mesh server config");
+        assert_eq!(mesh.advertise_addr.port(), 39527);
+    }
+
     #[test]
     fn kv_annotation_flags_flow_into_both_configs() {
         let cli = cli_args_from(&[
@@ -2749,6 +2907,66 @@ mod tests {
         assert!(Cli::try_parse_from(["smg", "--cache-ttl-secs", "0"]).is_err());
     }
 
+    /// The media placement and engine-side media flags must reach both
+    /// `RouterConfig` and the wrapped `ServerConfig.router_config`.
+    #[test]
+    fn mm_settings_flow_into_both_configs() {
+        let cli = cli_args_from(&[
+            "--mm-processing",
+            "worker",
+            "--mm-pixel-cache-mb",
+            "256",
+            "--mm-pixel-rdma",
+            "--rdma-listen-ip",
+            "10.0.0.7",
+            "--rdma-slot-ttl-s",
+            "600",
+            "--log-mm-timing",
+        ]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.mm_processing, Some(MmProcessingMode::Worker));
+        assert_eq!(router_config.mm_pixel_cache_mb, Some(256));
+        assert!(router_config.mm_pixel_rdma);
+        assert_eq!(router_config.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
+        assert_eq!(router_config.rdma_slot_ttl_s, Some(600));
+        assert!(router_config.log_mm_timing);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        let nested = &server_config.router_config;
+        assert_eq!(nested.mm_processing, Some(MmProcessingMode::Worker));
+        assert_eq!(nested.mm_pixel_cache_mb, Some(256));
+        assert!(nested.mm_pixel_rdma);
+        assert_eq!(nested.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
+        assert_eq!(nested.rdma_slot_ttl_s, Some(600));
+        assert!(nested.log_mm_timing);
+    }
+
+    #[test]
+    fn mm_settings_default_to_unset_in_both_configs() {
+        let cli = cli_args_from(&[]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.mm_processing, None);
+        assert_eq!(router_config.mm_pixel_cache_mb, None);
+        assert!(!router_config.mm_pixel_rdma);
+        assert_eq!(router_config.rdma_listen_ip, None);
+        assert_eq!(router_config.rdma_slot_ttl_s, None);
+        assert!(!router_config.log_mm_timing);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.mm_processing, None);
+        assert!(!server_config.router_config.log_mm_timing);
+    }
+
+    #[test]
+    fn mm_processing_rejects_unknown_modes_at_parse_time() {
+        assert!(Cli::try_parse_from(["smg", "--mm-processing", "routers"]).is_err());
+        assert!(Cli::try_parse_from(["smg", "--rdma-slot-ttl-s", "soon"]).is_err());
+        assert!(Cli::try_parse_from(["smg", "--mm-pixel-cache-mb", "-1"]).is_err());
+        let cli = cli_args_from(&["--mm-processing", "Router"]);
+        assert_eq!(cli.mm_processing, Some(MmProcessingMode::Router));
+    }
+
     /// The multimodal transport flags must reach both `RouterConfig` and the
     /// wrapped `ServerConfig.router_config`. Two-path config-plumbing guard.
     #[test]
@@ -2758,6 +2976,8 @@ mod tests {
             "shm",
             "--multimodal-shm-min-bytes",
             "1024",
+            "--multimodal-max-inflight-bytes",
+            "2048",
             "--mm-per-request-image-limit",
             "128",
         ]);
@@ -2769,6 +2989,7 @@ mod tests {
             "transport mode must reach RouterConfig via to_router_config"
         );
         assert_eq!(router_config.multimodal_shm_min_bytes, Some(1024));
+        assert_eq!(router_config.multimodal_max_inflight_bytes, Some(2048));
         assert_eq!(router_config.mm_per_request_image_limit, Some(128));
 
         let server_config = cli.to_server_config(router_config).unwrap();
@@ -2780,6 +3001,10 @@ mod tests {
         assert_eq!(
             server_config.router_config.multimodal_shm_min_bytes,
             Some(1024)
+        );
+        assert_eq!(
+            server_config.router_config.multimodal_max_inflight_bytes,
+            Some(2048)
         );
         assert_eq!(
             server_config.router_config.mm_per_request_image_limit,

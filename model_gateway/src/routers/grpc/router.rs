@@ -27,10 +27,10 @@ use super::{
     context::SharedComponents,
     harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
     mode::Mode,
-    multimodal::MultimodalComponents,
+    multimodal::{mm_settings, MultimodalComponents},
     pipeline::{Endpoint, PipelineDeps, RequestPipeline},
     regular::responses,
-    utils::ParserResolver,
+    utils::{ParserResolver, ResponseTemplateParsers},
 };
 use crate::{
     app_context::AppContext,
@@ -95,17 +95,24 @@ impl GrpcRouter {
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
 
-        // Create multimodal components (best-effort; non-fatal if initialization fails)
-        let multimodal = match MultimodalComponents::new(
-            ctx.multimodal_config_registry.clone(),
-            ctx.router_config.mm_per_request_image_limit,
-        ) {
-            Ok(mc) => Some(Arc::new(mc)),
-            Err(e) => {
-                tracing::warn!("Multimodal components initialization failed (non-fatal): {e}");
-                None
-            }
-        };
+        // What can fail here is the operator's own setting, so the router
+        // stops rather than coming up with media handling quietly switched
+        // off and every media request failing later for no stated reason.
+        let multimodal = Some(Arc::new(
+            MultimodalComponents::new(
+                ctx.multimodal_config_registry.clone(),
+                ctx.router_config.mm_per_request_image_limit,
+                ctx.router_config.multimodal_max_inflight_bytes,
+                mm_settings(),
+            )
+            .map_err(|e| format!("multimodal components: {e:#}"))?,
+        ));
+
+        let response_templates = Some(Arc::new(ResponseTemplateParsers::new(
+            tokenizer_registry.clone(),
+            reasoning_parser_factory.clone(),
+            tool_parser_factory.clone(),
+        )));
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
@@ -117,6 +124,7 @@ impl GrpcRouter {
                 worker_registry.clone(),
                 ctx.configured_tool_parser.clone(),
                 ctx.configured_reasoning_parser.clone(),
+                response_templates.clone(),
             ),
             multimodal,
         });
@@ -129,6 +137,7 @@ impl GrpcRouter {
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
+            response_templates,
             ctx.rate_limit_manager.clone(),
         );
         // Deps for the parser-free endpoints (completion/embeddings/classify).

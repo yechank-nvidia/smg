@@ -1,6 +1,6 @@
 [package]
 name = "smg"
-version = "1.10.1"
+version = "1.11.0"
 edition = "2021"
 description = "High-performance model-routing gateway for large-scale LLM deployments"
 license = "Apache-2.0"
@@ -80,6 +80,7 @@ uuid = { workspace = true, features = ["serde"] }
 # Workspace crates
 openai-protocol = { workspace = true, features = ["axum"] }
 reasoning-parser.workspace = true
+smg-response-template = { workspace = true, features = ["adapter"] }
 tool-parser.workspace = true
 wfaas.workspace = true
 llm-tokenizer.workspace = true
