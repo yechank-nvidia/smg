@@ -286,8 +286,11 @@ impl MessagePreparationStage {
         let tool_call_constraint = if let (false, Some(tool_choice)) =
             (filtered_tools.is_empty(), chat_tool_choice.as_ref())
         {
-            let reasoning =
-                utils::messages_reasoning_starts_in_prefill(request, tokenizer.as_ref());
+            let reasoning = utils::messages_reasoning_starts_in_prefill(
+                request,
+                processed_messages.continued_final_message,
+                tokenizer.as_ref(),
+            );
             ctx.components
                 .tool_parser_factory
                 .registry()

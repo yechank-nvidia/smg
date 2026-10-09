@@ -43,12 +43,14 @@ impl ChatRequestBuildingStage {
 /// the chat endpoint and the transcription endpoint. Assembles multimodal
 /// data, applies sampling defaults (from the chat request), finalizes stops,
 /// and injects PD/EPD metadata — returning the plan + attempt stamp. The
-/// caller supplies the `ResponseSpec`.
+/// caller supplies the `ResponseSpec`. `continued_final_message` is the
+/// rendered prompt's (`ProcessedMessages::continued_final_message`).
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn build_chat_backed_plan(
     ctx: &mut RequestContext,
     chat_request: &openai_protocol::chat::ChatCompletionRequest,
     processed_text: String,
+    continued_final_message: bool,
     token_ids: Vec<u32>,
     tool_constraints: Option<(String, String)>,
     id_prefix: &'static str,
@@ -119,7 +121,11 @@ pub(crate) async fn build_chat_backed_plan(
     // the first token; asking SGLang to also defer the grammar past `</think>`
     // would make the model owe a second one.
     let require_reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
-        utils::chat_reasoning_starts_in_prefill(chat_request, tokenizer.as_ref())
+        utils::chat_reasoning_starts_in_rendered_prefill(
+            chat_request,
+            continued_final_message,
+            tokenizer.as_ref(),
+        )
     }) && !utils::constraint_covers_reasoning(
         &ctx.components.tool_parser_factory,
         ctx.components
@@ -235,10 +241,12 @@ impl BuildStage for ChatRequestBuildingStage {
         };
 
         let unbilled_prompt_tokens = processed_messages.unbilled_prompt_tokens;
+        let continued_final_message = processed_messages.continued_final_message;
         let (plan, stamp) = build_chat_backed_plan(
             ctx,
             &chat_request,
             processed_messages.text,
+            continued_final_message,
             token_ids,
             tool_constraints,
             "chatcmpl-",
@@ -251,6 +259,7 @@ impl BuildStage for ChatRequestBuildingStage {
         ctx.state.response.unbilled_prompt_tokens = unbilled_prompt_tokens;
         let mut spec = ChatResponseSpec::from(chat_request.as_ref());
         spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
+        spec.continues_final_assistant = continued_final_message;
 
         Ok(BuildOutput {
             plan,

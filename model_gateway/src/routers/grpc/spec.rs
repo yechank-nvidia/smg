@@ -70,7 +70,9 @@ pub(crate) struct ChatResponseSpec {
     pub reasoning_effort: Option<String>,
     /// The typed `thinking.type` toggle.
     pub thinking: Option<bool>,
-    /// `continue_final_message` on a trailing assistant message.
+    /// `continue_final_message` on a trailing assistant message. Request
+    /// building replaces the request's ask with what the rendered prompt did
+    /// (`ProcessedMessages::continued_final_message`).
     pub continues_final_assistant: bool,
     /// `n`, normalized.
     pub expected_choices: u32,
@@ -165,7 +167,8 @@ pub(crate) struct MessagesResponseSpec {
     pub chat_tools: Vec<Tool>,
     pub stop_sequences: Option<Vec<String>>,
     /// A trailing assistant message with text and no tool call, continued as
-    /// a prefill.
+    /// a prefill. Request building replaces the request's ask with what the
+    /// rendered prompt did (`ProcessedMessages::continued_final_message`).
     pub continues_final_assistant: bool,
 }
 

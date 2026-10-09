@@ -141,6 +141,7 @@ pub fn process_messages(
             text: rendered.text,
             stop_sequences,
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
+            continued_final_message: rendered.continued_final_message,
         },
         rendered.encoding,
     ))

@@ -290,7 +290,11 @@ pub(crate) async fn prepare_chat_like(
         let tool_call_constraint = if let (false, Some(tool_choice)) =
             (constraint_tools.is_empty(), request.tool_choice.as_ref())
         {
-            let reasoning = utils::chat_reasoning_starts_in_prefill(request, tokenizer.as_ref());
+            let reasoning = utils::chat_reasoning_starts_in_rendered_prefill(
+                request,
+                processed_messages.continued_final_message,
+                tokenizer.as_ref(),
+            );
             ctx.components
                 .tool_parser_factory
                 .registry()

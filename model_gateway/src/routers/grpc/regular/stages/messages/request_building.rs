@@ -132,8 +132,13 @@ impl BuildStage for MessageRequestBuildingStage {
         // A structural tag that already opens with the reasoning block runs
         // from the first token; asking SGLang to also defer the grammar past
         // `</think>` would make the model owe a second one.
+        let continued_final_message = processed_messages.continued_final_message;
         let require_reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
-            utils::messages_reasoning_starts_in_prefill(&messages_request, tokenizer.as_ref())
+            utils::messages_reasoning_starts_in_prefill(
+                &messages_request,
+                continued_final_message,
+                tokenizer.as_ref(),
+            )
         }) && !utils::constraint_covers_reasoning(
             &ctx.components.tool_parser_factory,
             ctx.components
@@ -210,9 +215,12 @@ impl BuildStage for MessageRequestBuildingStage {
             ctx.state.media_refs_forwarded = true;
         }
 
+        let mut spec = MessagesResponseSpec::from(messages_request.as_ref());
+        spec.continues_final_assistant = continued_final_message;
+
         Ok(BuildOutput {
             plan: ExecutionPlan::generate(self.plan_kind, proto_request),
-            spec: ResponseSpec::Messages(MessagesResponseSpec::from(messages_request.as_ref())),
+            spec: ResponseSpec::Messages(spec),
             stamp: AttemptStamp {
                 id: id_stamp,
                 sampling_mask,

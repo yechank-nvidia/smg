@@ -295,6 +295,7 @@ impl TokenizerTrait for MockTokenizer {
         params: ChatTemplateParams,
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
+        let continued_final_message = params.continue_final_message;
         let mut text = self.apply_chat_template(messages, params)?;
         if let Some(prefix) = assistant_prefix {
             text.push_str(prefix);
@@ -316,6 +317,7 @@ impl TokenizerTrait for MockTokenizer {
             text,
             encoding,
             unbilled_prompt_tokens: self.unbilled_prompt_tokens,
+            continued_final_message,
         })
     }
 
